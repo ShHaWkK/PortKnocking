@@ -1,0 +1,7 @@
+# clé secrète partagée (dans un vrai projet, ne la commit pas en clair)
+secret: "ma_clef_super_secrete"
+knock_port: 9999        # port UDP où on reçoit le knock
+service_port: 22        # port à ouvrir (ex. SSH)
+time_tolerance: 30      # seconds de validité du timestamp
+open_duration: 60       # combien de temps on garde l'accès ouvert
+log_file: "../poc2_hmac/logs/server_hmac.log"
