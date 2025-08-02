@@ -1,0 +1,7 @@
+knock_port: 5005
+service_port: 5006
+open_duration: 5
+log_file: logs/server_rsa.log
+public_key: public.pem
+private_key: private.pem
+challenge_size: 16
