@@ -1,0 +1,6 @@
+challenge: "skolae"
+difficulty: 3
+knock_port: 10000
+service_port: 22
+open_duration: 60
+log_file: "../poc14_pow/logs/server_pow.log"
