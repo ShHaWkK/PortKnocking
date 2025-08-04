@@ -1,67 +1,46 @@
 #!/bin/bash
 
-# Configuration
-PORTS=(10001 10002 10003)         # Séquence de ports attendue
-SSH_PORT=2222                     # Port à protéger
-IP="127.0.0.1"                    # Adresse IP locale
-DELAI_OUVERTURE=10                # Durée d'ouverture en secondes
+IP=$(hostname -I | awk '{print $1}')
+PORT_KNOCK_SEQ=(10001 10002 10003)
+SSH_PORT=2222
+USER_TEST="kali"
 
-clear
-echo "===== Simulation du port-knocking en local ====="
+echo "─── Simulation du port-knocking en local ───"
 echo "Adresse IP locale : $IP"
-echo ""
 
-# Étape 1 : On bloque le port SSH (2222)
-echo "Fermeture du port SSH ($SSH_PORT)..."
+#  S'assurer que le port SSH est bien fermé au début
+echo -e "\\nFermeture du port SSH ($SSH_PORT)..."
 iptables -D INPUT -p tcp --dport $SSH_PORT -j ACCEPT 2>/dev/null
 iptables -A INPUT -p tcp --dport $SSH_PORT -j DROP
 echo "Port $SSH_PORT bloqué."
-echo ""
 
-# Fonction pour envoyer une séquence de knocks
-envoyer_knocks() {
-    local sequence=("$@")
-    for port in "${sequence[@]}"; do
-        echo "=> Connexion simulée sur le port $port"
-        nc -z $IP $port 2>/dev/null
-        sleep 0.5
-    done
-}
+# Test avec une séquence incorrecte
+echo -e "\\nTest avec une mauvaise séquence (ordre incorrect)..."
+for port in 10003 10002 10001; do
+    echo "⇒ Connexion simulée sur le port $port"
+    nc -z $IP $port 2>/dev/null
+done
 
-# Fonction pour tester si le port SSH est ouvert
-tester_port_ssh() {
-    echo ""
-    echo "Test de la connexion SSH sur le port $SSH_PORT..."
-    if nc -zvw1 $IP $SSH_PORT 2>&1 | grep -q succeeded; then
-        echo "✅ Port $SSH_PORT est OUVERT"
-    else
-        echo "❌ Port $SSH_PORT est FERMÉ"
-    fi
-    echo ""
-}
+echo -e "\\nTest de la connexion SSH sur le port $SSH_PORT après mauvaise séquence..."
+timeout 5 bash -c "cat < /dev/null > /dev/tcp/$IP/$SSH_PORT" 2>/dev/null && echo "✗ Port $SSH_PORT est OUVERT (ERREUR)" || echo "✓ Port $SSH_PORT est FERMÉ"
 
-# Étape 2 : Test avec MAUVAISE séquence
-echo "Test avec une mauvaise séquence (ordre incorrect)..."
-MAUVAISE_SEQ=("${PORTS[2]}" "${PORTS[1]}" "${PORTS[0]}")
-envoyer_knocks "${MAUVAISE_SEQ[@]}"
-tester_port_ssh
+# Test avec la bonne séquence
+echo -e "\\nTest avec la bonne séquence (ordre correct)..."
+for port in "${PORT_KNOCK_SEQ[@]}"; do
+    echo "⇒ Connexion simulée sur le port $port"
+    nc -z $IP $port 2>/dev/null
+done
 
-# Pause
-sleep 2
-
-# Étape 3 : Test avec la BONNE séquence
-echo "Test avec la bonne séquence (ordre correct)..."
-envoyer_knocks "${PORTS[@]}"
-
-echo "Ouverture temporaire du port $SSH_PORT pour $DELAI_OUVERTURE secondes..."
+echo "Ouverture temporaire du port $SSH_PORT pour 10 secondes..."
 iptables -I INPUT -p tcp --dport $SSH_PORT -s $IP -j ACCEPT
 
-tester_port_ssh
+# Tester la connexion SSH (réelle)
+echo -e "\\nTest de la connexion SSH sur le port $SSH_PORT..."
+timeout 5 bash -c "cat < /dev/null > /dev/tcp/$IP/$SSH_PORT" 2>/dev/null && echo "✓ Port $SSH_PORT est OUVERT" || echo "✗ Port $SSH_PORT est FERMÉ"
 
-# Attente puis fermeture du port
-sleep $DELAI_OUVERTURE
-echo "Fermeture automatique du port $SSH_PORT..."
+sleep 10
+echo -e "\\nFermeture automatique du port $SSH_PORT..."
 iptables -D INPUT -p tcp --dport $SSH_PORT -s $IP -j ACCEPT
-tester_port_ssh
+echo "✓ Port $SSH_PORT est maintenant FERMÉ."
 
-echo "===== Fin du test ====="
+echo -e "\\n─── Fin du test ───"
