@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Port-knocking simple local sans tcpdump
-# Auteur : [Votre prénom NOM]
+# Port-knocking simple local 
+# Auteur : ShHawk
 # Objectif : démonstration du mécanisme de port-knocking sans dépendances externes
 
 # Paramètres du port-knocking
