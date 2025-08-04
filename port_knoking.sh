@@ -1,61 +1,71 @@
 #!/bin/bash
 
-# 1. Configuration
-KNOCK_SEQ=(10001 10002 10003)
-SSH_PORT=2222
-INTERFACE=lo
-KNOCK_LOG="/tmp/knock.log"
-TIMEOUT=30
+# Port-knocking simple local sans tcpdump
+# Auteur : [Votre prénom NOM]
+# Objectif : démonstration du mécanisme de port-knocking sans dépendances externes
 
-echo "═══ Simulation du port-knocking en local ═══"
+# Paramètres du port-knocking
+KNOCK_SEQ=(10001 10002 10003)   # Séquence à frapper
+SSH_PORT=2222                   # Port protégé
+LOGFILE="/tmp/iptables_knock.log"
+IP=$(hostname -I | awk '{print $1}')   # Adresse IP de l'utilisateur
 
-# 2. Fermer le port 2222 (au cas où)
-sudo iptables -D INPUT -p tcp --dport $SSH_PORT -j ACCEPT 2>/dev/null
-echo "═══ Fermeture du port SSH ($SSH_PORT)..."
+echo ""
+echo "===== Simulation du port-knocking en local ====="
+echo "Adresse IP locale : $IP"
+echo ""
 
-# 3. Lancer tcpdump pour capter les knocks
-echo "═══ Lancement de l'écoute réseau avec tcpdump (10 sec)..."
-sudo timeout 10 tcpdump -i $INTERFACE "port ${KNOCK_SEQ[0]} or port ${KNOCK_SEQ[1]} or port ${KNOCK_SEQ[2]}" -nn > "$KNOCK_LOG" 2>/dev/null &
+# Nettoyer les règles de pare-feu et fermer le port SSH
+echo "Fermeture du port SSH ($SSH_PORT)..."
+sudo iptables -F
+sudo iptables -A INPUT -p tcp --dport $SSH_PORT -j DROP
 
-# 4. Attente courte avant knock
-sleep 2
-
-# 5. Simuler les knocks avec netcat (client)
-echo "═══ Envoi de la séquence de knocks depuis le client... ═══"
+# Activer la journalisation des knocks
+echo "Activation de la surveillance via iptables (ports : ${KNOCK_SEQ[*]})..."
 for port in "${KNOCK_SEQ[@]}"; do
-    nc -z 127.0.0.1 $port
-    echo "  ↳ Knock sur le port $port"
-    sleep 1
+    sudo iptables -A INPUT -p tcp --dport $port -j LOG --log-prefix "KNOCK_$port "
 done
 
-# 6. Attente fin de tcpdump
-sleep 3
-
-# 7. Analyse du log
-echo "═══ Analyse des knocks reçus... ═══"
-COUNT=0
+# Envoi de la séquence de knocks depuis le client (en local)
+echo ""
+echo "Envoi de la séquence de knocks dans le bon ordre..."
 for port in "${KNOCK_SEQ[@]}"; do
-    if grep "$port" "$KNOCK_LOG" >/dev/null; then
-        echo "=== Knock détecté sur $port ==="
-        ((COUNT++))
+    echo "↳ Connexion simulée sur le port $port"
+    nc -z 127.0.0.1 $port
+    sleep 0.5
+done
+
+# Attente pour laisser le temps à iptables de journaliser
+sleep 1
+
+# Analyse des logs récents pour détecter les knocks
+echo ""
+echo "Analyse des knocks reçus..."
+sudo journalctl -n 100 | grep "KNOCK_" > "$LOGFILE"
+
+ALL_OK=true
+for port in "${KNOCK_SEQ[@]}"; do
+    if grep -q "KNOCK_$port" "$LOGFILE"; then
+        echo "Knock détecté sur le port $port"
     else
-        echo "  [X] Knock manquant sur $port"
+        echo "Knock manquant sur le port $port"
+        ALL_OK=false
     fi
 done
 
-# 8. Vérification séquence complète
-if [ "$COUNT" -eq "${#KNOCK_SEQ[@]}" ]; then
-    echo " === Séquence correcte. Ouverture temporaire du port $SSH_PORT (30 sec)... ==="
-    sudo iptables -I INPUT -p tcp --dport $SSH_PORT -j ACCEPT
-
-    echo "Port $SSH_PORT ouvert pour 30 secondes..."
-    sleep $TIMEOUT
-
-    echo "Fermeture du port $SSH_PORT après timeout."
-    sudo iptables -D INPUT -p tcp --dport $SSH_PORT -j ACCEPT
+#  Vérification finale et ouverture du port si la séquence est correcte
+if [ "$ALL_OK" = true ]; then
+    echo ""
+    echo "Séquence correcte. Ouverture temporaire du port $SSH_PORT pour l'adresse IP $IP..."
+    sudo iptables -I INPUT -s $IP -p tcp --dport $SSH_PORT -j ACCEPT
+    sleep 20
+    echo "Fermeture du port $SSH_PORT..."
+    sudo iptables -D INPUT -s $IP -p tcp --dport $SSH_PORT -j ACCEPT
 else
-    echo "[X] Séquence incorrecte. Port $SSH_PORT reste fermé."
+    echo ""
+    echo "Séquence incorrecte. Le port $SSH_PORT reste fermé."
 fi
 
-# 9. Nettoyage
-rm -f "$KNOCK_LOG"
+# Fin
+echo ""
+echo "Fin de la simulation."
