@@ -15,7 +15,7 @@ echo "═══ Fermeture du port SSH ($SSH_PORT)..."
 
 # 3. Lancer tcpdump pour capter les knocks
 echo "═══ Lancement de l'écoute réseau avec tcpdump (10 sec)..."
-sudo timeout 10 tcpdump -i $INTERFACE port ${KNOCK_SEQ[0]} or port ${KNOCK_SEQ[1]} or port ${KNOCK_SEQ[2]} -nn > "$KNOCK_LOG" 2>/dev/null &
+sudo timeout 10 tcpdump -i $INTERFACE "port ${KNOCK_SEQ[0]} or port ${KNOCK_SEQ[1]} or port ${KNOCK_SEQ[2]}" -nn > "$KNOCK_LOG" 2>/dev/null &
 
 # 4. Attente courte avant knock
 sleep 2
