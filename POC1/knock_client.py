@@ -12,77 +12,75 @@ The code is intentionally verbose and heavily commented so it can be used
 for demonstrations, lab reports or exam presentations.
 """
 
-import argparse                      # Parse command-line arguments
-import logging                       # Write events to a log file
-import socket                        # Create TCP connection attempts
-import sys                           # Provide access to stdout for fancy output
-import time                          # Insert small pauses between knocks
+import argparse                      
+import logging                      
+import socket                       
+import sys                          
+import time                
 
 # --------------------------- logging setup ---------------------------------
-logger = logging.getLogger("knockd_demo")    # Name of the logger
-logger.setLevel(logging.INFO)                # Log only informative messages
-handler = logging.FileHandler("knockd_demo.log")  # Log file name
-fmt = logging.Formatter("%(asctime)s %(message)s") # Timestamped format
-handler.setFormatter(fmt)                    # Apply format to handler
-logger.addHandler(handler)                   # Add handler to logger
+logger = logging.getLogger("knockd_demo")    
+logger.setLevel(logging.INFO)              
+handler = logging.FileHandler("knockd_demo.log")  
+fmt = logging.Formatter("%(asctime)s %(message)s") 
+handler.setFormatter(fmt)                   
+logger.addHandler(handler)                  
 
 # --------------------------- utility functions -----------------------------
 def knock(host: str, port: int) -> None:
     """Send a single TCP SYN to the target host and port."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # Build TCP socket
-    sock.settimeout(0.5)                # Do not wait too long for responses
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  
+    sock.settimeout(0.5)                
     try:
-        sock.connect((host, port))      # Attempt connection
+        sock.connect((host, port))     
     except Exception:
-        pass                            # Ignore errors; knockd only needs the SYN
+        pass                        
     finally:
-        sock.close()                    # Always close the socket
+        sock.close()              
 
 def check_port(host: str, port: int) -> bool:
     """Return True if the TCP port appears open, False otherwise."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # Build TCP socket
-    sock.settimeout(2)                 # Two-second timeout for the test
-    result = sock.connect_ex((host, port))  # 0 means success
-    sock.close()                       # Clean up
-    return result == 0                 # Convert numeric code to boolean
-
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM) 
+    sock.settimeout(2)               
+    result = sock.connect_ex((host, port)) 
+    sock.close()                  
+    return result == 0             
 # --------------------------- argument parsing ------------------------------
 parser = argparse.ArgumentParser(description="Knock then test an SSH port")
 parser.add_argument("--host", required=True, help="IP address of the server")
 parser.add_argument("--port", type=int, default=2222, help="SSH port to verify")
 parser.add_argument("--close", action="store_true", help="Send reverse sequence")
-args = parser.parse_args()             # Read arguments into 'args'
-
-OPEN_SEQ = [8881, 7777, 9991]          # Sequence to open the port
-CLOSE_SEQ = [9991, 7777, 8881]         # Sequence to close the port
+args = parser.parse_args()            
+OPEN_SEQ = [8881, 7777, 9991]        
+CLOSE_SEQ = [9991, 7777, 8881]        
 
 # ------------------------------ main routine -------------------------------
-for p in OPEN_SEQ:                     # Iterate over the opening sequence
-    sys.stdout.write(f"[>] Knocking {p}\n")  # Pretty output with no buffering
-    sys.stdout.flush()                 # Force immediate display
-    logger.info("knock %s", p)         # Log the knock
-    knock(args.host, p)                # Fire the knock packet
-    time.sleep(0.5)                    # Short pause between knocks
+for p in OPEN_SEQ:                     
+    sys.stdout.write(f"[>] Knocking {p}\n")  
+    sys.stdout.flush()               
+    logger.info("knock %s", p)    
+    knock(args.host, p)              
+    time.sleep(0.5)                
 
 sys.stdout.write("[*] Waiting for the door to open...\n")
 sys.stdout.flush()
-time.sleep(3)                          # Allow knockd to open the port
+time.sleep(3)                         
 
-if check_port(args.host, args.port):   # Test if the SSH port is open
+if check_port(args.host, args.port):  
     sys.stdout.write(f"[+] Port {args.port} is open!\n")
     logger.info("port %s open", args.port)
 else:
     sys.stdout.write(f"[-] Port {args.port} is still closed.\n")
     logger.info("port %s closed", args.port)
 
-if args.close:                         # Optionally send closing sequence
+if args.close:                       
     sys.stdout.write("[*] Sending closing sequence...\n")
     sys.stdout.flush()
-    for p in CLOSE_SEQ:                # Iterate over closing ports
+    for p in CLOSE_SEQ:              
         sys.stdout.write(f"[<] Knocking {p}\n")
         sys.stdout.flush()
-        logger.info("close %s", p)     # Log the closing knock
-        knock(args.host, p)            # Send knock
+        logger.info("close %s", p)    
+        knock(args.host, p)           
         time.sleep(0.5)
 
-logger.info("done")                    # Log completion of the script
+logger.info("done")               
