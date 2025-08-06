@@ -8,19 +8,18 @@
 #           Run it only on a test machine.
 # ---------------------------------------------------------------------------
 
-set -e                                          # Stop immediately on errors
+set -e                                       
 
-if [[ $EUID -ne 0 ]]; then                      # Make sure we are root
-    echo "[!] Run this script as root."       # Warn the user
-    exit 1                                      # Abort if not root
+if [[ $EUID -ne 0 ]]; then                    
+    echo "[!] Run this script as root."     
+    exit 1                                 
 fi
 
-echo "[+] Installing knockd..."               # Install knockd package
-apt-get update -y >/dev/null                    # Refresh package index
-apt-get install -y knockd >/dev/null            # Install knockd silently
-
-echo "[+] Writing /etc/knockd.conf..."        # Create knockd configuration
-cat >/etc/knockd.conf <<'KNOCKEOF'               # Start here-document
+echo "[+] Installing knockd..."               
+apt-get update -y >/dev/null               
+apt-get install -y knockd >/dev/null       
+echo "[+] Writing /etc/knockd.conf..."     
+cat >/etc/knockd.conf <<'KNOCKEOF'             
 [options]
     UseSyslog
 
@@ -38,22 +37,21 @@ cat >/etc/knockd.conf <<'KNOCKEOF'               # Start here-document
     tcpflags      = syn
 KNOCKEOF
 
-echo "[+] Setting default firewall rule: DROP TCP 2222..."  # Block 2222 by default
-iptables -D INPUT -p tcp --dport 2222 -j DROP 2>/dev/null || true  # Remove old rule if any
-iptables -I INPUT -p tcp --dport 2222 -j DROP                    # Insert new DROP rule
+echo "[+] Setting default firewall rule: DROP TCP 2222..." 
+iptables -D INPUT -p tcp --dport 2222 -j DROP 2>/dev/null || true 
+iptables -I INPUT -p tcp --dport 2222 -j DROP               
 
-cleanup() {                                                      # Function to restore firewall
-    echo "[+] Cleaning up: removing DROP rule on port 2222."  # Inform user during cleanup
-    iptables -D INPUT -p tcp --dport 2222 -j DROP 2>/dev/null || true  # Remove rule safely
+cleanup() {                                                    
+    echo "[+] Cleaning up: removing DROP rule on port 2222." 
+    iptables -D INPUT -p tcp --dport 2222 -j DROP 2>/dev/null || true 
 }
-trap cleanup EXIT                                                # Register cleanup for script exit
+trap cleanup EXIT                                              
 
-echo "[+] Restarting knockd service..."                        # Restart knockd
-systemctl enable knockd >/dev/null                               # Ensure service starts at boot
-systemctl restart knockd                                         # Restart service now
+echo "[+] Restarting knockd service..."                 
+systemctl enable knockd >/dev/null                        
+systemctl restart knockd                        
 
-echo "[+] Checking that knockd is listening..."                # Verify knockd is running
-sleep 1                                                          # Short pause
-ss -lunpt | grep knockd || echo "[!] knockd not listening!"   # Display listening socket
-
-echo "[+] Setup complete. Use the client to knock."            # Final message
+echo "[+] Checking that knockd is listening..."            
+sleep 1                                                
+ss -lunpt | grep knockd || echo "[!] knockd not listening!" 
+echo "[+] Setup complete. Use the client to knock."     
