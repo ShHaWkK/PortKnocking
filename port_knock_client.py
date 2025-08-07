@@ -1,38 +1,60 @@
 #!/usr/bin/env python3
-"""Simple port knocking client."""
+"""Client très simple pour démontrer le mécanisme de port knocking.
 
-import socket  # Used to create TCP connections
-import sys  # Access to command-line arguments
-import time  # Allows delays between knocks
+Le programme envoie successivement des paquets TCP SYN sur une série de ports
+afin de déclencher l'ouverture d'un service distant si la séquence est
+correcte.
+"""
 
-# Default host to knock; can be overridden via CLI
-DEFAULT_HOST = "127.0.0.1"
-# Default sequence of ports to knock
-DEFAULT_SEQUENCE = [7000, 8000, 9000]
-# Delay between knocks in seconds
-DEFAULT_DELAY = 0.5
+import argparse
+import socket
+import time
 
-def knock(host: str, sequence: list[int], delay: float) -> None:
-    """Send a TCP connection attempt to each port in sequence."""
-    for port in sequence:
-        print(f"[*] Knock on port {port}")  # Log the knock
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:  # Create TCP socket
-            s.settimeout(1)  # Short timeout; we don't expect a response
-            try:
-                s.connect((host, port))  # Attempt to connect
-            except OSError:
-                pass  # Ignore errors; the knock is sent regardless
-        time.sleep(delay)  # Wait before next knock
 
-def parse_args() -> tuple[str, list[int]]:
-    """Parse host and port arguments from the command line."""
-    host = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_HOST
-    ports = [int(p) for p in sys.argv[2:]] if len(sys.argv) > 2 else DEFAULT_SEQUENCE
-    return host, ports
+def parse_args() -> argparse.Namespace:
+    """Récupère les paramètres fournis par l'utilisateur."""
+
+    parser = argparse.ArgumentParser(
+        description="Client de port knocking",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "host",
+        nargs="?",
+        default="127.0.0.1",
+        help="Hôte cible",
+    )
+    parser.add_argument(
+        "--seq",
+        default="7000 8000 9000",
+        help="Séquence de ports à frapper",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.5,
+        help="Délai entre deux knocks en secondes",
+    )
+    return parser.parse_args()
+
 
 def main() -> None:
-    host, sequence = parse_args()  # Retrieve target and ports
-    knock(host, sequence, DEFAULT_DELAY)  # Send knocks
+    """Envoie un SYN sur chaque port spécifié."""
+
+    args = parse_args()
+    sequence = [int(p) for p in args.seq.split() if p]
+
+    for port in sequence:
+        print(f"[*] Knock sur le port {port}")
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1)
+            try:
+                sock.connect((args.host, port))
+            except OSError:
+                pass  # Ignore toutes les erreurs, seul le SYN compte
+        time.sleep(args.delay)
+
 
 if __name__ == "__main__":
-    main()  # Execute only when run directly
+    main()
+

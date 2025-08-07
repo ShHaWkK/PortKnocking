@@ -1,112 +1,233 @@
 #!/usr/bin/env python3
-"""Simple port knocking server.
+"""Serveur de démonstration pour un mécanisme simple de port knocking.
 
-This script listens for connection attempts on TCP ports 7000 -> 8000 -> 9000.
-If a client hits these ports in the correct order with less than 10 seconds
-between knocks, the script inserts an iptables rule to allow that IP to access
-port 2222 for 20 seconds.
-
-The script must be run as root because it uses raw sockets via scapy and
-modifies iptables rules.
+Le script écoute des paquets TCP SYN sur une séquence de ports. Lorsqu'une
+adresse IP frappe les bons ports dans l'ordre défini et dans un délai
+raisonnable, une règle *iptables* est insérée afin d'autoriser temporairement
+la connexion sur un port spécifique.
 """
 
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import signal
 import subprocess
+import sys
 import threading
 import time
-from scapy.all import sniff, TCP, IP
+import shutil
 
-# Ports that compose the knocking sequence
-KNOCK_SEQUENCE = [7000, 8000, 9000]
-# Max delay allowed between two successive knocks (seconds)
-STEP_TIMEOUT = 10
-# Port to open if the knocking sequence is correct
-SSH_PORT = 2222
-# Time during which the SSH port stays open (seconds)
-OPEN_DURATION = 20
-
-# Dictionary mapping source IP -> (index of next expected port, time of last knock, last port)
-knock_state: dict[str, tuple[int, float, int]] = {}
-
-def reset_state(ip: str) -> None:
-    """Reset the stored knock state for a given IP."""
-    knock_state[ip] = (0, 0, -1)
-
-def open_port_for(ip: str) -> None:
-    """Insert an iptables rule to allow ip to access SSH_PORT."""
-    print(f"[+] Ouverture du port {SSH_PORT} pour {ip}")
-    subprocess.run([
-        "iptables", "-I", "INPUT", "-p", "tcp", "--dport", str(SSH_PORT),
-        "-s", ip, "-j", "ACCEPT"
-    ], check=False)
-
-    def close_later() -> None:
-        time.sleep(OPEN_DURATION)
-        print(f"[-] Fermeture du port {SSH_PORT} pour {ip}")
-        subprocess.run([
-            "iptables", "-D", "INPUT", "-p", "tcp", "--dport", str(SSH_PORT),
-            "-s", ip, "-j", "ACCEPT"
-        ], check=False)
-
-    threading.Thread(target=close_later, daemon=True).start()
-
-def process_packet(packet) -> None:
-    """Callback executed for each sniffed packet."""
-    if TCP not in packet or IP not in packet:
-        return
-
-    src_ip = packet[IP].src
-    dst_port = packet[TCP].dport
-    flags = int(packet[TCP].flags)
-
-    # Only consider SYN packets to avoid counting resets
-    if not (flags & 0x02):  # 0x02 = SYN flag
-        return
-
-    # Ignore packets that are not part of the knocking sequence
-    if dst_port not in KNOCK_SEQUENCE:
-        return
-
-    index, last_time, last_port = knock_state.get(src_ip, (0, 0, -1))
-    expected_port = KNOCK_SEQUENCE[index]
-
-    # Ignore duplicate packets for the same port
-    if dst_port == last_port:
-        return
-
-    print(f"[*] Knock reçu de {src_ip} sur le port {dst_port}")
-
-    # Check if the received port is the expected one
-    if dst_port != expected_port:
-        reset_state(src_ip)
-        return
-
-    # Check timing between knocks
-    now = time.time()
-    if index > 0 and now - last_time > STEP_TIMEOUT:
-        reset_state(src_ip)
-        return
-
-    # Update state
-    index += 1
-    knock_state[src_ip] = (index, now, dst_port)
-
-    # Sequence complete?
-    if index == len(KNOCK_SEQUENCE):
-        print(f"[+] Séquence correcte pour {src_ip}")
-        reset_state(src_ip)
-        open_port_for(src_ip)
+# Vérification de la disponibilité de Scapy -------------------------------
+try:  # noqa: SIM105 - bloc pour émettre un message d'erreur clair
+    from scapy.all import IP, TCP, sniff  # type: ignore
+except Exception:  # pragma: no cover - Scapy manquant
+    print(
+        "[-] Le module Scapy est requis. Installez-le avec 'pip install scapy'.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
-def main() -> None:
-    print("Port knocking en écoute sur 7000 -> 8000 -> 9000")
-    # Sniff TCP packets on the three ports. store=0 avoids storing packets in memory.
+def parse_args() -> argparse.Namespace:
+    """Analyse les arguments de la ligne de commande."""
+
+    parser = argparse.ArgumentParser(
+        description="Serveur de port knocking minimal",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--iface",
+        default="lo",
+        help="Interface réseau à sniffer",
+    )
+    parser.add_argument(
+        "--seq",
+        default="7000 8000 9000",
+        help="Séquence de ports attendus (séparés par des espaces)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=10,
+        help="Délai maximum entre deux knocks en secondes",
+    )
+    parser.add_argument(
+        "--open-port",
+        dest="open_port",
+        type=int,
+        default=2222,
+        help="Port à ouvrir lorsque la séquence est correcte",
+    )
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=20,
+        help="Durée d'ouverture du port en secondes",
+    )
+    return parser.parse_args()
+
+
+def require_root() -> None:
+    """Vérifie que le script est exécuté avec les privilèges administrateur."""
+
+    if os.geteuid() != 0:
+        print("[-] Ce script doit être exécuté en tant que root.", file=sys.stderr)
+        sys.exit(1)
+
+
+def require_iptables() -> None:
+    """S'assure que la commande iptables est disponible."""
+
+    if shutil.which("iptables") is None:
+        print("[-] La commande 'iptables' est requise.", file=sys.stderr)
+        sys.exit(1)
+
+
+def main() -> None:  # noqa: C901 - complexité gérée par commentaires
+    """Point d'entrée principal du serveur."""
+
+    args = parse_args()
+    require_root()
+    require_iptables()
+
+    # Préparation de la séquence et des paramètres -----------------------
+    sequence = [int(p) for p in args.seq.split() if p]
+    timeout = args.timeout
+    open_port = args.open_port
+    duration = args.duration
+
+    # Journalisation dans un fichier knockd.log --------------------------
+    logging.basicConfig(
+        filename="knockd.log",
+        level=logging.INFO,
+        format="%(asctime)s %(message)s",
+    )
+
+    # État courant des knocks : {ip: (étape, timestamp, dernier_port)}
+    state: dict[str, tuple[int, float, int | None]] = {}
+    # IP ayant une règle iptables ouverte afin de pouvoir nettoyer
+    opened_rules: set[str] = set()
+
+    # ------------------------------------------------------------------
+    def reset(ip: str) -> None:
+        """Réinitialise l'état de knock pour l'adresse IP donnée."""
+
+        state[ip] = (0, 0.0, None)
+
+    # ------------------------------------------------------------------
+    def close_rule(ip: str) -> None:
+        """Supprime la règle iptables associée à l'IP."""
+
+        subprocess.run(
+            [
+                "iptables",
+                "-D",
+                "INPUT",
+                "-s",
+                ip,
+                "-p",
+                "tcp",
+                "--dport",
+                str(open_port),
+                "-j",
+                "ACCEPT",
+            ],
+            check=False,
+        )
+        opened_rules.discard(ip)
+        logging.info("Fermeture du port %d pour %s", open_port, ip)
+
+    # ------------------------------------------------------------------
+    def open_rule(ip: str) -> None:
+        """Ajoute la règle iptables pour l'IP puis programme sa suppression."""
+
+        subprocess.run(
+            [
+                "iptables",
+                "-I",
+                "INPUT",
+                "-s",
+                ip,
+                "-p",
+                "tcp",
+                "--dport",
+                str(open_port),
+                "-j",
+                "ACCEPT",
+            ],
+            check=False,
+        )
+        opened_rules.add(ip)
+        logging.info("Ouverture du port %d pour %s", open_port, ip)
+
+        # Thread non-daemon pour supprimer la règle après `duration` secondes
+        def worker() -> None:
+            time.sleep(duration)
+            close_rule(ip)
+
+        threading.Thread(target=worker, daemon=False).start()
+
+    # ------------------------------------------------------------------
+    def process(packet) -> None:
+        """Traite chaque paquet capturé par Scapy."""
+
+        if TCP not in packet or IP not in packet:
+            return
+        if not (int(packet[TCP].flags) & 0x02):  # Ne prendre que les SYN
+            return
+
+        src_ip = packet[IP].src
+        dst_port = int(packet[TCP].dport)
+
+        # Port attendu
+        step, last_ts, last_port = state.get(src_ip, (0, 0.0, None))
+
+        # Ignorer les doublons
+        if dst_port == last_port:
+            return
+
+        now = time.time()
+        if step > 0 and now - last_ts > timeout:
+            reset(src_ip)
+            step, last_ts, last_port = state[src_ip]
+
+        expected = sequence[step]
+        if dst_port != expected:
+            reset(src_ip)
+            return
+
+        step += 1
+        state[src_ip] = (step, now, dst_port)
+
+        if step == len(sequence):
+            logging.info("Séquence correcte pour %s", src_ip)
+            reset(src_ip)
+            open_rule(src_ip)
+
+    # ------------------------------------------------------------------
+    def cleanup(signum: int, frame: object) -> None:  # noqa: ARG001 - exigence signal
+        """Supprime les règles iptables ouvertes avant de quitter."""
+
+        for ip in list(opened_rules):
+            close_rule(ip)
+        sys.exit(0)
+
+    # Gestion des signaux pour un arrêt propre
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    # Démarrage du sniffer ------------------------------------------------
+    # Utilisation d'un filtre Python afin d'éviter la dépendance à libpcap
     sniff(
-        filter="tcp and (dst port 7000 or dst port 8000 or dst port 9000)",
-        prn=process_packet,
+        prn=process,
         store=0,
-        iface="lo",  # Listen on loopback for local testing
+        iface=args.iface,
+        lfilter=lambda pkt: TCP in pkt and IP in pkt and int(pkt[TCP].dport) in sequence,
     )
 
 
 if __name__ == "__main__":
     main()
+
