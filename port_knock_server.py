@@ -1,381 +1,207 @@
 #!/usr/bin/env python3
-"""Serveur de démonstration pour un mécanisme simple de port knocking.
+"""
+Serveur Port-Knocking (iptables) — affichage complet dans le terminal.
 
-Le script écoute des paquets TCP SYN sur une séquence de ports. Lorsqu'une
-adresse IP frappe les bons ports dans l'ordre défini et dans un délai
-raisonnable, une règle *iptables* est insérée afin d'autoriser temporairement
-la connexion sur un port spécifique.
+Fonctions :
+- Vérif root et présence d'iptables (ipset optionnel).
+- Sniff Scapy des TCP SYN vers la séquence (par défaut 7000->8000->9000).
+- Tolérance au jitter (--timeout), anti-doublons.
+- Après séquence valide : ouverture d'une règle iptables ACCEPT vers --open-port (par défaut 2222) pour l'IP source, pendant --duration secondes.
+- Affichage des règles iptables AVANT/APRÈS (preuve).
+- Anti-spam : 3 séquences invalides -> quarantaine ipset 60 s (si ipset dispo).
+- Logs JSONL (écrit et aussi imprimé à l’écran).
+
+Utilisation simple :
+  sudo python3 port_knock_server.py
+Options utiles :
+  --iface lo --seq "7000 8000 9000" --timeout 10 --open-port 2222 --duration 20
 """
 
 from __future__ import annotations
+import argparse, json, os, sys, time, shutil, signal, socket, threading, subprocess
+from typing import Dict, Tuple, Optional
 
-import argparse
-import logging
-import os
-import signal
-import subprocess
-import sys
-import threading
-import time
-import shutil
-
-# Vérification de la disponibilité de Scapy -------------------------------
-try:  # noqa: SIM105 - bloc pour émettre un message d'erreur clair
+# --- Dépendance sniff ---
+try:
     from scapy.all import IP, TCP, sniff  # type: ignore
-except Exception:  # pragma: no cover - Scapy manquant
-    print(
-        "[-] Le module Scapy est requis. Installez-le avec 'pip install scapy'.",
-        file=sys.stderr,
-    )
+except Exception:
+    print("[-] Scapy requis. Installe :  pip install scapy", file=sys.stderr)
     sys.exit(1)
 
-
+# ---------- CLI ----------
 def parse_args() -> argparse.Namespace:
-    """Analyse les arguments de la ligne de commande."""
-
-    parser = argparse.ArgumentParser(
-        description="Serveur de port knocking minimal",
+    p = argparse.ArgumentParser(
+        description="Serveur Port-Knocking (iptables)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--iface",
-        default="lo",
-        help="Interface réseau à sniffer",
-    )
-    parser.add_argument(
-        "--seq",
-        default="7000 8000 9000",
-        help="Séquence de ports attendus (séparés par des espaces)",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=10,
-        help="Délai maximum entre deux knocks en secondes",
-    )
-    parser.add_argument(
-        "--open-port",
-        dest="open_port",
-        type=int,
-        default=2222,
-        help="Port à ouvrir lorsque la séquence est correcte",
-    )
-    parser.add_argument(
-        "--duration",
-        type=int,
-        default=20,
-        help="Durée d'ouverture du port en secondes",
-    )
-    return parser.parse_args()
+    p.add_argument("--iface", default="lo", help="Interface à sniffer")
+    p.add_argument("--seq", default="7000 8000 9000", help="Séquence de ports (espaces)")
+    p.add_argument("--timeout", type=int, default=10, help="Délai max entre knocks (s)")
+    p.add_argument("--open-port", dest="open_port", type=int, default=2222, help="Port à ouvrir")
+    p.add_argument("--duration", type=int, default=20, help="Durée d'ouverture (s)")
+    p.add_argument("--json-log", default="knockd.jsonl", help="Fichier de logs JSONL")
+    p.add_argument("--quarantine-set", default="knock_quarantine", help="Nom du set ipset")
+    p.add_argument("--quarantine-timeout", type=int, default=60, help="Durée quarantaine (s)")
+    p.add_argument("--anti-spam", type=int, default=3, help="Échecs avant quarantaine")
+    return p.parse_args()
 
-
-def require_root() -> None:
-    """Vérifie que le script est exécuté avec les privilèges administrateur."""
-
+# ---------- Utilitaires ----------
+def require_root():
     if os.geteuid() != 0:
-        print("[-] Ce script doit être exécuté en tant que root.", file=sys.stderr)
+        print("[-] Lance ce script en root (sudo).", file=sys.stderr)
         sys.exit(1)
 
+def have(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
 
-def require_iptables() -> None:
-    """S'assure que la commande iptables est disponible."""
+def run(cmd: list[str], check=False) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
 
-    if shutil.which("iptables") is None:
-        print("[-] La commande 'iptables' est requise.", file=sys.stderr)
-        sys.exit(1)
+def print_rules(open_port: int, qset: str):
+    out = run(["iptables-save"]).stdout
+    lines = [l for l in out.splitlines() if f"--dport {open_port}" in l or qset in l or "match-set" in l]
+    print("\n[ Règles pertinentes ]")
+    print("\n".join(lines) if lines else "(aucune règle correspondante)")
+    print()
 
+def jprint(event: str, **kw):
+    msg = {"ts": round(time.time(), 3), "event": event, **kw}
+    print(f"[{event}] {kw}")
+    with open(ARGS.json_log, "a", encoding="utf-8") as f:
+        f.write(json.dumps(msg, ensure_ascii=False) + "\n")
 
-def main() -> None:  # noqa: C901 - complexité gérée par commentaires
-    """Point d'entrée principal du serveur."""
+def ensure_quarantine(qset: str, qtimeout: int) -> bool:
+    if not have("ipset"):
+        print("[i] ipset non détecté : quarantaine désactivée.")
+        return False
+    run(["ipset","create", qset, "hash:ip", "timeout", str(qtimeout)], check=False)
+    # Règle DROP si membre du set (si absente)
+    chk = run(["iptables","-C","INPUT","-m","set","--match-set", qset, "src","-j","DROP"])
+    if chk.returncode != 0:
+        run(["iptables","-I","INPUT","1","-m","set","--match-set", qset, "src","-j","DROP"])
+    return True
 
-    args = parse_args()
+def quarantine(ip: str):
+    if have("ipset"):
+        run(["ipset","add", ARGS.quarantine_set, ip, "timeout", str(ARGS.quarantine_timeout)], check=False)
+        jprint("quarantine", ip=ip, seconds=ARGS.quarantine_timeout)
+
+def open_rule(ip: str, port: int):
+    # évite les doublons
+    chk = run(["iptables","-C","INPUT","-s",ip,"-p","tcp","--dport",str(port),"-j","ACCEPT"])
+    if chk.returncode != 0:
+        run(["iptables","-I","INPUT","-s",ip,"-p","tcp","--dport",str(port),"-j","ACCEPT"], check=False)
+
+def close_rule(ip: str, port: int):
+    run(["iptables","-D","INPUT","-s",ip,"-p","tcp","--dport",str(port),"-j","ACCEPT"], check=False)
+
+# ---------- Programme ----------
+def main():
+    global ARGS
+    ARGS = parse_args()
     require_root()
-    require_iptables()
+    if not have("iptables"):
+        print("[-] iptables requis.", file=sys.stderr); sys.exit(1)
 
-    # Préparation de la séquence et des paramètres -----------------------
-    sequence = [int(p) for p in args.seq.split() if p]
-    timeout = args.timeout
-    open_port = args.open_port
-    duration = args.duration
+    seq = [int(p) for p in ARGS.seq.split() if p]
+    timeout = ARGS.timeout
+    port = ARGS.open_port
+    duration = ARGS.duration
 
-    # Journalisation dans un fichier knockd.log --------------------------
-    logging.basicConfig(
-        filename="knockd.log",
-        level=logging.INFO,
-        format="%(asctime)s %(message)s",
-    )
+    quarantine_enabled = ensure_quarantine(ARGS.quarantine_set, ARGS.quarantine_timeout)
 
-    # État courant des knocks : {ip: (étape, timestamp, dernier_port)}
-    state: dict[str, tuple[int, float, int | None]] = {}
-    # IP ayant une règle iptables ouverte afin de pouvoir nettoyer
-    opened_rules: set[str] = set()
+    # États
+    state: Dict[str, Tuple[int, float, Optional[int]]] = {}
+    invalid: Dict[str, int] = {}
+    opened: set[str] = set()
+    timers: Dict[str, threading.Thread] = {}
+    lock = threading.Lock()
 
-    # ------------------------------------------------------------------
-    def reset(ip: str) -> None:
-        """Réinitialise l'état de knock pour l'adresse IP donnée."""
+    print(f"[i] Écoute sur {ARGS.iface} | séquence: {' -> '.join(map(str, seq))} | "
+          f"port à ouvrir: {port} ({duration}s)")
+    print_rules(port, ARGS.quarantine_set)
 
+    def reset(ip: str):
         state[ip] = (0, 0.0, None)
 
-    # ------------------------------------------------------------------
-    def close_rule(ip: str) -> None:
-        """Supprime la règle iptables associée à l'IP."""
+    def punish(ip: str):
+        invalid[ip] = invalid.get(ip, 0) + 1
+        jprint("invalid_seq", ip=ip, count=invalid[ip])
+        if quarantine_enabled and invalid[ip] >= ARGS.anti_spam:
+            quarantine(ip)
+            invalid[ip] = 0
 
-        subprocess.run(
-            [
-                "iptables",
-                "-D",
-                "INPUT",
-                "-s",
-                ip,
-                "-p",
-                "tcp",
-                "--dport",
-                str(open_port),
-                "-j",
-                "ACCEPT",
-            ],
-            check=False,
-        )
-        opened_rules.discard(ip)
-        logging.info("Fermeture du port %d pour %s", open_port, ip)
+    def open_for(ip: str):
+        with lock:
+            if ip in opened:
+                return
+            open_rule(ip, port)
+            opened.add(ip)
+            jprint("open", ip=ip, port=port, duration=duration)
+            print_rules(port, ARGS.quarantine_set)
+            print(f"[+] Séquence OK pour {ip} → port {port} OUVERT {duration}s")
+            print(f"    👉  ssh -p {port} <user>@{ip}")
 
-    # ------------------------------------------------------------------
-    def open_rule(ip: str) -> None:
-        """Ajoute la règle iptables pour l'IP puis programme sa suppression."""
+            def worker():
+                time.sleep(duration)
+                with lock:
+                    if ip in opened:
+                        close_rule(ip, port)
+                        opened.discard(ip)
+                        jprint("close", ip=ip, port=port)
+                        print_rules(port, ARGS.quarantine_set)
 
-        subprocess.run(
-            [
-                "iptables",
-                "-I",
-                "INPUT",
-                "-s",
-                ip,
-                "-p",
-                "tcp",
-                "--dport",
-                str(open_port),
-                "-j",
-                "ACCEPT",
-            ],
-            check=False,
-        )
-        opened_rules.add(ip)
-        logging.info("Ouverture du port %d pour %s", open_port, ip)
+            t = threading.Thread(target=worker, daemon=False)
+            timers[ip] = t
+            t.start()
 
-        # Thread non-daemon pour supprimer la règle après `duration` secondes
-        def worker() -> None:
-            time.sleep(duration)
-            close_rule(ip)
-
-        threading.Thread(target=worker, daemon=False).start()
-
-    # ------------------------------------------------------------------
-    def process(packet) -> None:
-        """Traite chaque paquet capturé par Scapy."""
-
-        if TCP not in packet or IP not in packet:
+    def process(pkt):
+        if TCP not in pkt or IP not in pkt:
             return
-        if not (int(packet[TCP].flags) & 0x02):  # Ne prendre que les SYN
+        if not (int(pkt[TCP].flags) & 0x02):  # SYN uniquement
             return
 
-        src_ip = packet[IP].src
-        dst_port = int(packet[TCP].dport)
+        ip = pkt[IP].src
+        dport = int(pkt[TCP].dport)
+        step, last_ts, last_port = state.get(ip, (0, 0.0, None))
 
-        # Port attendu
-        step, last_ts, last_port = state.get(src_ip, (0, 0.0, None))
-
-        # Ignorer les doublons
-        if dst_port == last_port:
+        # anti-doublons
+        if dport == last_port:
             return
 
         now = time.time()
         if step > 0 and now - last_ts > timeout:
-            reset(src_ip)
-            step, last_ts, last_port = state[src_ip]
+            reset(ip); punish(ip)
+            step, last_ts, last_port = state[ip]
 
-        expected = sequence[step]
-        if dst_port != expected:
-            reset(src_ip)
-            return
+        expected = seq[step]
+        if dport != expected:
+            reset(ip); punish(ip); return
 
         step += 1
-        state[src_ip] = (step, now, dst_port)
+        state[ip] = (step, now, dport)
+        jprint("step", ip=ip, received=dport, expected=expected, progress=step)
 
-        if step == len(sequence):
-            logging.info("Séquence correcte pour %s", src_ip)
-            reset(src_ip)
-            open_rule(src_ip)
+        if step == len(seq):
+            jprint("sequence_ok", ip=ip)
+            reset(ip)
+            open_for(ip)
 
-    # ------------------------------------------------------------------
-    def cleanup(signum: int, frame: object) -> None:  # noqa: ARG001 - exigence signal
-        """Supprime les règles iptables ouvertes avant de quitter."""
-
-        for ip in list(opened_rules):
-            close_rule(ip)
+    def cleanup(signum, frame):
+        print("\n[+] Nettoyage…")
+        for ip in list(opened):
+            close_rule(ip, port)
+            jprint("close", ip=ip, port=port)
+        for t in list(timers.values()):
+            t.join(timeout=1)
         sys.exit(0)
 
-    # Gestion des signaux pour un arrêt propre
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
-    # Démarrage du sniffer ------------------------------------------------
-    # Utilisation d'un filtre Python afin d'éviter la dépendance à libpcap
-    sniff(
-        prn=process,
-        store=0,
-        iface=args.iface,
-        lfilter=lambda pkt: TCP in pkt and IP in pkt and int(pkt[TCP].dport) in sequence,
-    )
-    return parser.parse_args()
-
-
-def require_root() -> None:
-    """Vérifie que le script est exécuté avec les privilèges administrateur."""
-
-    if os.geteuid() != 0:
-        print("[-] Ce script doit être exécuté en tant que root.", file=sys.stderr)
-        sys.exit(1)
-
-
-def main() -> None:  # noqa: C901 - complexité gérée par commentaires
-    """Point d'entrée principal du serveur."""
-
-    args = parse_args()
-    require_root()
-
-    # Préparation de la séquence et des paramètres -----------------------
-    sequence = [int(p) for p in args.seq.split() if p]
-    timeout = args.timeout
-    open_port = args.open_port
-    duration = args.duration
-
-    # Journalisation dans un fichier knockd.log --------------------------
-    logging.basicConfig(
-        filename="knockd.log",
-        level=logging.INFO,
-        format="%(asctime)s %(message)s",
-    )
-
-    # État courant des knocks : {ip: (étape, timestamp, dernier_port)}
-    state: dict[str, tuple[int, float, int | None]] = {}
-    # IP ayant une règle iptables ouverte afin de pouvoir nettoyer
-    opened_rules: set[str] = set()
-
-    # ------------------------------------------------------------------
-    def reset(ip: str) -> None:
-        """Réinitialise l'état de knock pour l'adresse IP donnée."""
-
-        state[ip] = (0, 0.0, None)
-
-    # ------------------------------------------------------------------
-    def close_rule(ip: str) -> None:
-        """Supprime la règle iptables associée à l'IP."""
-
-        subprocess.run(
-            [
-                "iptables",
-                "-D",
-                "INPUT",
-                "-s",
-                ip,
-                "-p",
-                "tcp",
-                "--dport",
-                str(open_port),
-                "-j",
-                "ACCEPT",
-            ],
-            check=False,
-        )
-        opened_rules.discard(ip)
-        logging.info("Fermeture du port %d pour %s", open_port, ip)
-
-    # ------------------------------------------------------------------
-    def open_rule(ip: str) -> None:
-        """Ajoute la règle iptables pour l'IP puis programme sa suppression."""
-
-        subprocess.run(
-            [
-                "iptables",
-                "-I",
-                "INPUT",
-                "-s",
-                ip,
-                "-p",
-                "tcp",
-                "--dport",
-                str(open_port),
-                "-j",
-                "ACCEPT",
-            ],
-            check=False,
-        )
-        opened_rules.add(ip)
-        logging.info("Ouverture du port %d pour %s", open_port, ip)
-
-        # Thread non-daemon pour supprimer la règle après `duration` secondes
-        def worker() -> None:
-            time.sleep(duration)
-            close_rule(ip)
-
-        threading.Thread(target=worker, daemon=False).start()
-
-    # ------------------------------------------------------------------
-    def process(packet) -> None:
-        """Traite chaque paquet capturé par Scapy."""
-
-        if TCP not in packet or IP not in packet:
-            return
-        if not (int(packet[TCP].flags) & 0x02):  # Ne prendre que les SYN
-            return
-
-        src_ip = packet[IP].src
-        dst_port = int(packet[TCP].dport)
-
-        # Port attendu
-        step, last_ts, last_port = state.get(src_ip, (0, 0.0, None))
-
-        # Ignorer les doublons
-        if dst_port == last_port:
-            return
-
-        now = time.time()
-        if step > 0 and now - last_ts > timeout:
-            reset(src_ip)
-            step, last_ts, last_port = state[src_ip]
-
-        expected = sequence[step]
-        if dst_port != expected:
-            reset(src_ip)
-            return
-
-        step += 1
-        state[src_ip] = (step, now, dst_port)
-
-        if step == len(sequence):
-            logging.info("Séquence correcte pour %s", src_ip)
-            reset(src_ip)
-            open_rule(src_ip)
-
-    # ------------------------------------------------------------------
-    def cleanup(signum: int, frame: object) -> None:  # noqa: ARG001 - exigence signal
-        """Supprime les règles iptables ouvertes avant de quitter."""
-
-        for ip in list(opened_rules):
-            close_rule(ip)
-        sys.exit(0)
-
-    # Gestion des signaux pour un arrêt propre
-    signal.signal(signal.SIGINT, cleanup)
-    signal.signal(signal.SIGTERM, cleanup)
-
-    ports_filter = " or ".join(f"dst port {p}" for p in sequence)
-    bpf = f"tcp and ({ports_filter})"
-
-    # Démarrage du sniffer ------------------------------------------------
-    sniff(filter=bpf, prn=process, store=0, iface=args.iface)
-
+    # Sniffer (sans dépendre de libpcap : filtre Python)
+    lfilter = lambda p: TCP in p and IP in p and int(p[TCP].dport) in seq
+    sniff(prn=process, store=0, iface=ARGS.iface, lfilter=lfilter)
 
 if __name__ == "__main__":
     main()
-
