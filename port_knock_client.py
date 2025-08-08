@@ -6,55 +6,32 @@ afin de déclencher l'ouverture d'un service distant si la séquence est
 correcte.
 """
 
-import argparse
-import socket
-import time
+import argparse, socket, time, sys
 
-
-def parse_args() -> argparse.Namespace:
-    """Récupère les paramètres fournis par l'utilisateur."""
-
-    parser = argparse.ArgumentParser(
+def parse_args():
+    p = argparse.ArgumentParser(
         description="Client de port knocking",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "host",
-        nargs="?",
-        default="127.0.0.1",
-        help="Hôte cible",
-    )
-    parser.add_argument(
-        "--seq",
-        default="7000 8000 9000",
-        help="Séquence de ports à frapper",
-    )
-    parser.add_argument(
-        "--delay",
-        type=float,
-        default=0.5,
-        help="Délai entre deux knocks en secondes",
-    )
-    return parser.parse_args()
+    p.add_argument("host", nargs="?", default="127.0.0.1", help="Hôte cible")
+    p.add_argument("--seq", default="7000 8000 9000", help="Séquence de ports (espaces)")
+    p.add_argument("--delay", type=float, default=0.5, help="Délai entre knocks (s)")
+    return p.parse_args()
 
-
-def main() -> None:
-    """Envoie un SYN sur chaque port spécifié."""
-
-    args = parse_args()
-    sequence = [int(p) for p in args.seq.split() if p]
-
-    for port in sequence:
+def main():
+    a = parse_args()
+    seq = [int(x) for x in a.seq.split() if x.strip()]
+    print(f"[i] Cible: {a.host} | Séquence: {' -> '.join(map(str, seq))} | Délai: {a.delay}s")
+    for port in seq:
         print(f"[*] Knock sur le port {port}")
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(1)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
             try:
-                sock.connect((args.host, port))
+                s.connect((a.host, port))  # émet un SYN
             except OSError:
-                pass  # Ignore toutes les erreurs, seul le SYN compte
-        time.sleep(args.delay)
-
+                pass  # normal : le port est fermé/filtré
+        time.sleep(a.delay)
+    print("[✓] Séquence envoyée. Tente la connexion SSH si le serveur a validé la séquence.")
 
 if __name__ == "__main__":
     main()
-
