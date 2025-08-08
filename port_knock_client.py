@@ -5,7 +5,7 @@ Client Port-Knocking (one-command) :
 - Envoie 7000 -> 8000 -> 9000 vers 127.0.0.1 (TCP SYN)
 - Installe automatiquement une clé SSH si besoin (id_ed25519)
 - Lance la connexion SSH automatiquement (sans mot de passe)
-Utilisation :  python3 port_knock_client.py
+Usage :  python3 port_knock_client.py
 """
 
 import os, pathlib, socket, time, subprocess, getpass
@@ -35,7 +35,6 @@ def ensure_key_and_authorized_keys():
     os.chmod(auth, 0o600)
 
 def auto_ssh(user: str):
-    # Confort démo : on ne bloque pas sur la vérification de l’empreinte
     subprocess.call([
         "ssh", "-p", str(OPEN_PORT),
         "-o", "StrictHostKeyChecking=no",
@@ -53,7 +52,6 @@ def main():
             except OSError: pass           # normal : fermé/filtré
         time.sleep(DELAY)
 
-    # SSH auto par clé
     ensure_key_and_authorized_keys()
     user = os.environ.get("USER") or getpass.getuser() or "user"
     print("[✓] Séquence envoyée. Connexion SSH automatique…")
