@@ -3,17 +3,15 @@
 """
 Serveur Port-Knocking (one-command, tout s'affiche dans le terminal)
 
-Fonctions :
-- Vérification root + dépendances (scapy, iptables ; ipset si dispo)
 - Démarre un sshd éphémère sur 127.0.0.1:2222 si rien n'écoute
 - Ajoute un DROP par défaut sur 2222 (invisibilité) et l'enlève au cleanup
 - Sniff (Scapy+BPF) des TCP SYN sur 7000->8000->9000 (iface lo)
 - Suivi d'état par IP + tolérance au jitter (10s) + anti-doublons
-- Après séquence valide : INSERT d’une règle ACCEPT pour l’IP pendant 20s
+- Après séquence valide : INSERT d’une règle ACCEPT pour l’IP (ouverture **illimitée** par défaut)
 - Anti-spam : 3 séquences invalides => quarantaine ipset 60s (si ipset présent)
 - Affiche les règles iptables pertinentes AVANT/APRÈS + écrit un JSONL
 
-Utilisation :  sudo python3 port_knock_server.py
+Usage :  sudo python3 port_knock_server.py
 """
 
 from __future__ import annotations
@@ -24,7 +22,7 @@ from typing import Dict, Tuple, Optional
 IFACE = "lo"
 SEQUENCE = [7000, 8000, 9000]
 OPEN_PORT = 2222
-OPEN_DURATION = 20        # secondes
+OPEN_DURATION = 0         # 0 = illimité (pas d’auto-fermeture)
 STEP_TIMEOUT = 10         # délai max entre knocks
 QUARANTINE_SET = "knock_quarantine"
 QUARANTINE_TIMEOUT = 60   # secondes
@@ -49,20 +47,6 @@ def have(cmd: str) -> bool:
 def run(cmd: list[str], check=False) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
 
-def iptables_rule_exists(rule: list[str]) -> bool:
-    # rule = ["INPUT", ...]
-    p = run(["iptables", "-C"] + rule)
-    return p.returncode == 0
-
-def iptables_insert(rule: list[str], first: bool = False):
-    if not iptables_rule_exists(rule):
-        run(["iptables", "-I", rule[0], "1" if first else ""] + rule[1:], check=False)
-
-def iptables_delete(rule: list[str]):
-    # supprime si existe
-    if iptables_rule_exists(rule):
-        run(["iptables", "-D"] + rule, check=False)
-
 def print_rules():
     out = run(["iptables-save"]).stdout if have("iptables") else ""
     lines = [l for l in out.splitlines()
@@ -85,43 +69,43 @@ def ensure_quarantine() -> bool:
         print("[i] ipset/iptables non détectés : quarantaine désactivée.")
         return False
     run(["ipset", "create", QUARANTINE_SET, "hash:ip", "timeout", str(QUARANTINE_TIMEOUT)], check=False)
-    drop_q = ["INPUT", "-m", "set", "--match-set", QUARANTINE_SET, "src", "-j", "DROP"]
-    iptables_insert(drop_q, first=True)
+    # Règle DROP si membre du set (si absente)
+    chk = run(["iptables","-C","INPUT","-m","set","--match-set",QUARANTINE_SET,"src","-j","DROP"])
+    if chk.returncode != 0:
+        run(["iptables","-I","INPUT","1","-m","set","--match-set",QUARANTINE_SET,"src","-j","DROP"])
     return True
 
 def quarantine(ip: str):
     if have("ipset"):
-        run(["ipset", "add", QUARANTINE_SET, ip, "timeout", str(QUARANTINE_TIMEOUT)], check=False)
+        run(["ipset","add",QUARANTINE_SET,ip,"timeout",str(QUARANTINE_TIMEOUT)], check=False)
         jprint("quarantine", ip=ip, seconds=QUARANTINE_TIMEOUT)
 
 def open_rule(ip: str):
-    rule = ["INPUT", "-s", ip, "-p", "tcp", "--dport", str(OPEN_PORT), "-j", "ACCEPT"]
-    if not iptables_rule_exists(rule):
-        run(["iptables", "-I"] + rule, check=False)
-    jprint("open", ip=ip, port=OPEN_PORT, duration=OPEN_DURATION)
+    # évite les doublons
+    chk = run(["iptables","-C","INPUT","-s",ip,"-p","tcp","--dport",str(OPEN_PORT),"-j","ACCEPT"])
+    if chk.returncode != 0:
+        run(["iptables","-I","INPUT","-s",ip,"-p","tcp","--dport",str(OPEN_PORT),"-j","ACCEPT"], check=False)
+    jprint("open", ip=ip, port=OPEN_PORT, duration=("infinite" if OPEN_DURATION==0 else OPEN_DURATION))
     print_rules()
 
 def close_rule(ip: str):
-    rule = ["INPUT", "-s", ip, "-p", "tcp", "--dport", str(OPEN_PORT), "-j", "ACCEPT"]
-    iptables_delete(rule)
+    run(["iptables","-D","INPUT","-s",ip,"-p","tcp","--dport",str(OPEN_PORT),"-j","ACCEPT"], check=False)
     jprint("close", ip=ip, port=OPEN_PORT)
     print_rules()
 
 def default_drop_enable():
     # rend 2222 invisible par défaut (DROP)
-    rule = ["INPUT", "-p", "tcp", "--dport", str(OPEN_PORT), "-j", "DROP"]
-    iptables_insert(rule, first=True)
+    run(["iptables","-I","INPUT","1","-p","tcp","--dport",str(OPEN_PORT),"-j","DROP"], check=False)
 
 def default_drop_disable():
-    rule = ["INPUT", "-p", "tcp", "--dport", str(OPEN_PORT), "-j", "DROP"]
-    iptables_delete(rule)
+    run(["iptables","-D","INPUT","-p","tcp","--dport",str(OPEN_PORT),"-j","DROP"], check=False)
 
 def _port_listening(port: int) -> bool:
     if have("ss"):
-        out = run(["ss", "-lnt"]).stdout
+        out = run(["ss","-lnt"]).stdout
         return f":{port} " in out or f":{port}\n" in out
     if have("netstat"):
-        out = run(["netstat", "-lnt"]).stdout
+        out = run(["netstat","-lnt"]).stdout
         return f":{port} " in out
     return False
 
@@ -162,7 +146,7 @@ def main():
     timers: Dict[str, threading.Thread] = {}
     lock = threading.Lock()
 
-    print(f"[i] Écoute sur {IFACE} | séquence: {' -> '.join(map(str, SEQUENCE))} | port à ouvrir: {OPEN_PORT} ({OPEN_DURATION}s)")
+    print(f"[i] Écoute sur {IFACE} | séquence: {' -> '.join(map(str, SEQUENCE))} | port à ouvrir: {OPEN_PORT} ({'∞' if OPEN_DURATION==0 else f'{OPEN_DURATION}s'})")
     print_rules()
 
     def reset(ip: str): state[ip] = (0, 0.0, None)
@@ -179,14 +163,15 @@ def main():
             open_rule(ip)
             opened.add(ip)
             user = os.environ.get("SUDO_USER") or os.environ.get("USER") or "user"
-            print(f"[+] Séquence OK pour {ip} → port {OPEN_PORT} OUVERT {OPEN_DURATION}s")
+            print(f"[+] Séquence OK pour {ip} → port {OPEN_PORT} OUVERT {'∞' if OPEN_DURATION==0 else f'{OPEN_DURATION}s'}")
             print(f"    👉  ssh -p {OPEN_PORT} {user}@{ip}")
-            def worker():
-                time.sleep(OPEN_DURATION)
-                with lock:
-                    if ip in opened:
-                        close_rule(ip); opened.discard(ip)
-            t = threading.Thread(target=worker, daemon=False); timers[ip]=t; t.start()
+            if OPEN_DURATION > 0:
+                def worker():
+                    time.sleep(OPEN_DURATION)
+                    with lock:
+                        if ip in opened:
+                            close_rule(ip); opened.discard(ip)
+                t = threading.Thread(target=worker, daemon=False); timers[ip]=t; t.start()
 
     def process(pkt):
         if TCP not in pkt or IP not in pkt: return
@@ -194,16 +179,26 @@ def main():
         ip = pkt[IP].src
         dport = int(pkt[TCP].dport)
         step, last_ts, last_port = state.get(ip, (0, 0.0, None))
-        if dport == last_port: return  # doublon
+
+        # doublon
+        if dport == last_port: return
+
         now = time.time()
         if step > 0 and now - last_ts > STEP_TIMEOUT:
+            # timeout au milieu d'une séquence
             reset(ip); punish(ip); step, last_ts, last_port = state[ip]
+
         expected = SEQUENCE[step]
         if dport != expected:
-            reset(ip); punish(ip); return
+            # On ne punit que si une séquence était en cours
+            if step > 0:
+                reset(ip); punish(ip)
+            return
+
         step += 1
         state[ip] = (step, now, dport)
         jprint("step", ip=ip, received=dport, expected=expected, progress=step)
+
         if step == len(SEQUENCE):
             jprint("sequence_ok", ip=ip)
             reset(ip); open_for(ip)
