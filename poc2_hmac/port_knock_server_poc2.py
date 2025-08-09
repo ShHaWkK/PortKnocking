@@ -7,21 +7,22 @@ SSH_PORT          = 2222
 SSH_LISTEN        = "127.0.0.1"
 IFACE_DEFAULT     = "lo"
 
-KNOCKS_WINDOW_S   = 30       # taille de fenêtre HMAC
-ALLOW_PAST_WINDOWS= 1        # tolère N-1
+KNOCKS_WINDOW_S   = 30        # fenêtre HMAC
+ALLOW_PAST_WINDOWS= 1         # tolère N-1
 SEQUENCE_LEN      = 3
 MIN_PORT, MAX_PORT= 40000, 50000
-MAX_SEQ_JITTER    = 10       # max 10 s entre deux knocks
+MAX_SEQ_JITTER    = 10        # 10 s entre deux knocks
+DUP_SUPPRESS_S    = 2.0       # ignorer retransmissions du même port pendant N s
 SPA_PORT          = 45444
-SPA_TTL_S         = 120      # validité du nonce/ts dans SPA
-SPA_GRACE_S       = 10       # délai max entre "sequence_ok" et SPA
-OPEN_DURATION     = 0        # 0 = illimité (tant que serveur tourne)
+SPA_TTL_S         = 120       # validité nonce/ts SPA
+SPA_GRACE_S       = 10        # délai max séquenceOK -> SPA
+OPEN_DURATION     = 0         # 0 = illimité tant que le serveur tourne
 
-QUARANTINE_THRESHOLD = 3     # après 3 erreurs => ipset
+QUARANTINE_THRESHOLD = 3
 QUARANTINE_TIMEOUT   = 60
 IPSET_NAME           = "knock_quarantine"
 
-MASTER_SECRET_PATH   = "/etc/portknock/secret"          # base64 (32 octets typ.)
+MASTER_SECRET_PATH   = "/etc/portknock/secret"
 USER_COPY_PATH_FMT   = "{home}/.config/portknock/secret"
 JSONL_PATH           = "knockd_poc2.jsonl"
 PRINT_RULES_CMD      = ["bash","-lc","iptables-save | egrep '2222|knock_quarantine' || true"]
@@ -34,7 +35,7 @@ def ensure_pydeps():
     try: importlib.import_module("scapy.all")
     except Exception:
         _pip_install("scapy"); import importlib as _; _.import_module("scapy.all")
-    try: importlib.import_module("cryptography.hazmat.primitives.ciphers.aead")
+    try: importlib_imported = importlib.import_module("cryptography.hazmat.primitives.ciphers.aead")
     except Exception:
         _pip_install("cryptography")
 ensure_pydeps()
@@ -61,7 +62,7 @@ def log_event(ev):
     shown = {k:v for k,v in ev.items() if k not in ("ts",)}
     print(f"[{ev['event']}] {shown}")
 
-# ----- Secrets (lecture tolérante) -----
+# ----- Secrets -----
 def b64_read_tolerant(raw: str) -> bytes:
     token = raw.strip().split()[0] if raw.strip() else ""
     try:
@@ -75,8 +76,7 @@ def load_or_create_master_secret(path=MASTER_SECRET_PATH) -> bytes:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if not os.path.exists(path):
         raw = secrets.token_bytes(32)
-        with open(path,"w") as f:
-            f.write(base64.b64encode(raw).decode()+"\n")
+        with open(path,"w") as f: f.write(base64.b64encode(raw).decode()+"\n")
         os.chmod(path, 0o600)
         print(f"[+] Secret maître généré : {path}")
     else:
@@ -88,23 +88,18 @@ def load_or_create_master_secret(path=MASTER_SECRET_PATH) -> bytes:
     return sec
 
 def copy_secret_for_user(secret_b64: str):
-    # propriétaire = SUDO_USER si présent, sinon l’utilisateur courant
     sudo_user = os.environ.get("SUDO_USER") or getpass.getuser()
     try:
-        pw = pwd.getpwnam(sudo_user)
-        home = pw.pw_dir
-        uid, gid = pw.pw_uid, pw.pw_gid
+        pw  = pwd.getpwnam(sudo_user)
+        home, uid, gid = pw.pw_dir, pw.pw_uid, pw.pw_gid
     except Exception:
-        home = os.path.expanduser("~")
-        uid, gid = os.getuid(), os.getgid()
+        home, uid, gid = os.path.expanduser("~"), os.getuid(), os.getgid()
     dst = USER_COPY_PATH_FMT.format(home=home)
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     with open(dst,"w") as f: f.write(secret_b64 + "\n")
     os.chmod(dst, 0o600)
-    try:
-        os.chown(dst, uid, gid)  # <-- donne la bonne propriété
-    except PermissionError:
-        pass
+    try: os.chown(dst, uid, gid)
+    except PermissionError: pass
     print(f"[i] Copie du secret pour {sudo_user}: {dst} (chmod 600, owner {sudo_user})")
 
 def epoch_window(ts=None):
@@ -221,21 +216,24 @@ def in_knock_range(port: int) -> bool:
 def on_tcp_syn(pkt):
     if not pkt.haslayer(IP) or not pkt.haslayer(TCP): return
     dport = int(pkt[TCP].dport)
-    ip    = pkt[IP].src  # on autorise 127.0.0.1 pour test loopback
+    ip    = pkt[IP].src  # loopback autorisé
 
-    # On ignore tout ce qui n'est pas dans le range de knocks
     if not in_knock_range(dport):
         return
 
     seqs = valid_sequences_for_ip(ip)
-    # fenêtre verrouillée à la 1re frappe
     st = states.get(ip, {"progress":0,"last_ts":0,"last_port":-1,"win":max(seqs.keys()),"bad":0})
     win = st["win"]
     seq = seqs.get(win, seqs[max(seqs.keys())])
     expected = seq[st["progress"]]
     t = now()
 
-    if dport == expected and (t - st["last_ts"] <= MAX_SEQ_JITTER or st["progress"]==0) and dport != st["last_port"]:
+    # 1) filtrer les retransmissions du même port (ne pas compter en erreur)
+    if dport == st["last_port"] and (t - st["last_ts"] <= DUP_SUPPRESS_S):
+        return
+
+    # 2) étape valide ?
+    if dport == expected and (t - st["last_ts"] <= MAX_SEQ_JITTER or st["progress"]==0):
         st.update({"progress": st["progress"]+1, "last_ts": t, "last_port": dport})
         states[ip] = st
         log_event({"event":"step","ip":ip,"received":dport,"expected":expected,"progress":st["progress"]})
@@ -243,15 +241,16 @@ def on_tcp_syn(pkt):
             log_event({"event":"sequence_ok","ip":ip})
             states[ip]["progress"]=0
             pending_spa[ip] = t + SPA_GRACE_S
-    else:
-        # on ne compte l'erreur que si le port est dans notre range (déjà garanti)
-        st.update({"progress":0,"last_ts":t,"last_port":dport,"bad": st.get("bad",0)+1})
-        states[ip]=st
-        log_event({"event":"invalid_seq","ip":ip,"count":st["bad"]})
-        if st["bad"] >= QUARANTINE_THRESHOLD:
-            quarantine_ip(ip)
-            log_event({"event":"quarantine","ip":ip,"timeout":QUARANTINE_TIMEOUT})
-            st["bad"]=0
+        return
+
+    # 3) sinon, vraie erreur de séquence
+    st.update({"progress":0,"last_ts":t,"last_port":dport,"bad": st.get("bad",0)+1})
+    states[ip]=st
+    log_event({"event":"invalid_seq","ip":ip,"received":dport,"expected":expected,"count":st["bad"]})
+    if st["bad"] >= QUARANTINE_THRESHOLD:
+        quarantine_ip(ip)
+        log_event({"event":"quarantine","ip":ip,"timeout":QUARANTINE_TIMEOUT})
+        st["bad"]=0
 
 def spa_listener(stop_evt):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -322,7 +321,6 @@ def main():
     ap.add_argument("-i","--iface", default=IFACE_DEFAULT, help=f"Interface à sniffer (défaut: {IFACE_DEFAULT})")
     args = ap.parse_args()
 
-    # Secret maître
     SECRET = load_or_create_master_secret()
     copy_secret_for_user(base64.b64encode(SECRET).decode())
 
@@ -337,8 +335,9 @@ def main():
     stop_evt = threading.Event()
     t_spa = threading.Thread(target=spa_listener, args=(stop_evt,), daemon=True); t_spa.start()
 
-    # --------- BPF serré : SYN + dport dans 40000-50000 ---------
+    # BPF serré : SYN + dport dans 40000-50000 (destination seulement)
     bpf = f"tcp and (dst portrange {MIN_PORT}-{MAX_PORT}) and (tcp[13] & 2 != 0)"
+    print(f"[i] BPF: {bpf}")
     try:
         sniff(filter=bpf, prn=on_tcp_syn, store=0, iface=args.iface)
     except KeyboardInterrupt:
