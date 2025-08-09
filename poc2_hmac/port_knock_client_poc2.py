@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+POC2 Client — Séquence HMAC + SPA AES-GCM
+- Lit le secret base64 (tolérant) depuis ~/.config/portknock/secret
+  ou depuis la variable d’environnement KNOCK_SECRET_B64
+- Devine l’IP source réellement utilisée (utile hors loopback)
+- Envoie 3 knocks (HMAC) puis un SPA (UDP) chiffré AES-GCM avec nonce anti-rejeu
+- Ouvre ensuite automatiquement une session SSH (-p 2222)
+"""
 import os, sys, time, json, hmac, base64, hashlib, socket, argparse, getpass, subprocess, binascii, secrets
 
 SSH_PORT        = 2222
@@ -58,9 +66,21 @@ def derive_spa_key(secret: bytes, ip: str, win: int) -> bytes:
 # --------- Réseau ----------
 def send_syn(host, port, timeout=1.0):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(timeout)
-    try: s.connect((host, port))   # émet un SYN ; OSError attendu si rien n’écoute
+    try: s.connect((host, port))
     except OSError: pass
     finally: s.close()
+
+def guess_source_ip(server_ip: str) -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((server_ip, 1))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1" if server_ip in ("127.0.0.1","localhost") else socket.gethostbyname(socket.gethostname())
+    finally:
+        try: s.close()
+        except: pass
+    return ip
 
 def ensure_local_ssh_key():
     home = os.path.expanduser("~"); sshd = os.path.join(home, ".ssh")
@@ -101,31 +121,34 @@ def main():
     args = ap.parse_args()
 
     secret = load_secret(file_path=args.secret_file)
+
     server = args.server
-    client_ip = "127.0.0.1" if server in ("127.0.0.1","localhost") else socket.gethostbyname(socket.gethostname())
+    server_ip = "127.0.0.1" if server in ("127.0.0.1","localhost") else socket.gethostbyname(server)
+    client_ip = "127.0.0.1" if server_ip=="127.0.0.1" else guess_source_ip(server_ip)
 
     w   = current_window()
     seq = derive_sequence(secret, client_ip, w)
-    print(f"[i] Cible: {server} | IP vue: {client_ip} | Fenêtre: {w} ({WINDOW_SECONDS}s) | Séquence: {' -> '.join(map(str, seq))} | Délai: {STEP_DELAY}s")
+    print(f"[i] Cible: {server_ip} | IP vue: {client_ip} | Fenêtre: {w} ({WINDOW_SECONDS}s) | "
+          f"Séquence: {' -> '.join(map(str, seq))} | Délai: {STEP_DELAY}s")
 
     for p in seq:
         print(f"[*] Knock sur le port {p}")
-        send_syn(server, p); time.sleep(STEP_DELAY)
+        send_syn(server_ip, p); time.sleep(STEP_DELAY)
 
     print("[*] Envoi du SPA chiffré…")
     user = getpass.getuser()
-    pkt  = build_spa_packet(secret, server, client_ip, user, args.duration)
+    pkt  = build_spa_packet(secret, server_ip, client_ip, user, args.duration)
     if args.dump_spa:
         with open(args.dump_spa,"wb") as f: f.write(pkt)
         print(f"[i] SPA sauvegardé dans {args.dump_spa} (hex {binascii.hexlify(pkt)[:32].decode()}…)")
 
-    send_spa_packet(pkt, server)
+    send_spa_packet(pkt, server_ip)
 
     if args.no_ssh: return
     try: ensure_local_ssh_key()
     except Exception as e: print(f"[!] Clé SSH locale: {e}")
     print("[✓] SPA envoyé. Connexion SSH automatique…")
-    os.execvp("ssh", ["ssh","-p",str(SSH_PORT),"-o","StrictHostKeyChecking=accept-new",f"{user}@{server}"])
+    os.execvp("ssh", ["ssh","-p",str(SSH_PORT),"-o","StrictHostKeyChecking=accept-new",f"{user}@{server_ip}"])
 
 if __name__ == "__main__":
     main()
