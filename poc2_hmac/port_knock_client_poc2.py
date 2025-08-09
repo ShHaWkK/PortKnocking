@@ -18,12 +18,9 @@ def b64_read_tolerant(raw: str) -> bytes:
     try:
         return base64.b64decode(token, validate=True)
     except Exception:
-        try:
-            data = base64.b64decode(token)
-            if not data: raise ValueError("vide")
-            return data
-        except Exception as e:
-            raise ValueError(f"Secret local invalide : {e}")
+        data = base64.b64decode(token)
+        if not data: raise ValueError("vide")
+        return data
 
 def load_secret(env_var="KNOCK_SECRET_B64", file_path=DEFAULT_SECRET_FILE) -> bytes:
     if os.environ.get(env_var):
