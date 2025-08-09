@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+POC 2 — Client
+- Envoie la séquence de knocks DYNAMIQUES (HMAC)
+- Envoie ensuite un SPA AES-GCM (timestamp + nonce) → ouverture 2222
+- Peut se connecter automatiquement en SSH
+"""
+
 import os, sys, time, json, hmac, base64, hashlib, socket, argparse, getpass, subprocess, binascii
-# ========== Auto-install Python deps ==========
-def _pip_install(pkg):
-    subprocess.run([sys.executable,"-m","pip","install","-q",pkg], check=True)
-def ensure_python_deps():
-    import importlib
-    try: importlib.import_module("cryptography.hazmat.primitives.ciphers.aead")
-    except Exception: _pip_install("cryptography")
-ensure_python_deps()
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # ========== Paramètres (doivent matcher le serveur) ==========
@@ -31,9 +30,7 @@ def derive_secret():
         print("[ERREUR] Secret invalide (base64).", e); sys.exit(1)
 SECRET = derive_secret()
 
-def current_window(ts=None):
-    if ts is None: ts = time.time()
-    return int(ts // WINDOW_SECONDS)
+def current_window(ts=None): return int((ts if ts is not None else time.time()) // WINDOW_SECONDS)
 
 def derive_sequence(secret: bytes, client_ip: str, epoch_window: int):
     rng = MAX_PORT - MIN_PORT + 1
@@ -50,9 +47,17 @@ def derive_sequence(secret: bytes, client_ip: str, epoch_window: int):
         if port not in ports: ports.append(port)
     return ports
 
+def get_src_ip_towards(host: str) -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((host, 9))  # port arbitraire; pas d’envoi réel
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
 def send_syn(host, port, timeout=1.0):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(timeout)
-    try: s.connect((host, port))
+    try: s.connect((host, port))     # émet un SYN ; l’échec est normal
     except OSError: pass
     finally: s.close()
 
@@ -86,7 +91,7 @@ def send_spa_packet(pkt: bytes, server_ip: str):
     s.sendto(pkt, (server_ip, SPA_PORT)); s.close()
 
 def main():
-    ap = argparse.ArgumentParser(description="POC2 Client - Knocks HMAC + SPA AES-GCM (auto-deps)")
+    ap = argparse.ArgumentParser(description="POC2 Client - Knocks HMAC + SPA AES-GCM")
     ap.add_argument("server", nargs="?", default=SSH_LISTEN, help="IP/nom du serveur (défaut: %(default)s)")
     ap.add_argument("--no-ssh", action="store_true", help="Ne pas lancer SSH après SPA")
     ap.add_argument("--duration", type=int, default=0, help="Durée d'ouverture demandée (0 = illimitée)")
@@ -95,7 +100,7 @@ def main():
     args = ap.parse_args()
 
     server = args.server
-    client_ip = "127.0.0.1" if server in ("127.0.0.1","localhost") else socket.gethostbyname(socket.gethostname())
+    client_ip = get_src_ip_towards(server)
 
     w   = current_window() + args.window_offset
     seq = derive_sequence(SECRET, client_ip, w)
