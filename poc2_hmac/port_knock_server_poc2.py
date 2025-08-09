@@ -1,19 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-POC2 Serveur — Port-knocking HMAC dynamique + SPA AES-GCM
-- Secret maître généré en base64 dans /etc/portknock/secret (32 octets par défaut)
-- Copie du secret pour l'utilisateur sudoer dans ~/.config/portknock/secret
-  (avec chown vers l’utilisateur pour éviter les PermissionError)
-- Invisibilité : DROP par défaut sur le port SSH protégé (iptables)
-- Quarantaine IP (ipset) après séquences invalides répétées
-- Séquence de knocks dérivée : HMAC(secret, f"{IP}|fenetre") → 3 ports (40000-50000)
-- Fenêtre temporelle glissante (30s) + tolérance N-1
-- SPA (UDP) obligatoire juste après la séquence (grace 10s), payload AES-GCM + nonce anti-rejeu
-- En local (loopback), 127.0.0.1 N’EST PAS ignorée (correctif demandé)
-"""
 import os, sys, time, json, hmac, hashlib, base64, shutil, subprocess, threading, socket, argparse, getpass, secrets, pwd
-from datetime import datetime
 
 # ===================== Paramètres =====================
 SSH_PORT            = 2222
@@ -21,44 +8,47 @@ SSH_LISTEN          = "127.0.0.1"
 IFACE_DEFAULT       = "lo"
 
 KNOCKS_WINDOW_S     = 30        # taille de fenêtre pour la séquence HMAC
-ALLOW_PAST_WINDOWS  = 1         # tolère N-1 pour jitter
+ALLOW_PAST_WINDOWS  = 1         # tolère N-1 (jitter)
 SEQUENCE_LEN        = 3
 MIN_PORT, MAX_PORT  = 40000, 50000
-MAX_SEQ_JITTER      = 10        # 10 s max entre deux knocks
+MAX_SEQ_JITTER      = 10        # 10s max entre deux knocks
 
 SPA_PORT            = 45444
-SPA_TTL_S           = 120       # validité du nonce/horodatage dans le SPA
-SPA_GRACE_S         = 10        # délai max entre "sequence_ok" et réception du SPA
-
+SPA_TTL_S           = 120       # validité nonce/horodatage dans le SPA
+SPA_GRACE_S         = 10        # délai max entre "sequence_ok" et SPA
 OPEN_DURATION       = 0         # 0 = illimité (tant que serveur tourne)
 
-QUARANTINE_THRESHOLD= 3         # après 3 séquences invalides => ipset
-QUARANTINE_TIMEOUT  = 60
-IPSET_NAME          = "knock_quarantine"
+QUARANTINE_THRESHOLD = 3        # après 3 séquences invalides => ipset
+QUARANTINE_TIMEOUT   = 60
+IPSET_NAME           = "knock_quarantine"
 
-MASTER_SECRET_PATH  = "/etc/portknock/secret"             # base64 (32 octets par défaut)
-USER_COPY_PATH_FMT  = "{home}/.config/portknock/secret"
-JSONL_PATH          = "knockd_poc2.jsonl"
-PRINT_RULES_CMD     = ["bash","-lc","iptables-save | egrep '2222|knock_quarantine' || true"]
+MASTER_SECRET_PATH   = "/etc/portknock/secret"          # base64 (au moins 16 octets)
+USER_COPY_PATH_FMT   = "{home}/.config/portknock/secret"
+JSONL_PATH           = "knockd_poc2.jsonl"
+PRINT_RULES_CMD      = ["bash","-lc","iptables-save | egrep '2222|knock_quarantine' || true"]
+
+SECRET = b""  # assigné au démarrage
 
 # ===================== Dépendances Python =====================
 def _pip_install(pkg):
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg], check=True)
+    subprocess.run([sys.executable,"-m","pip","install","-q",pkg], check=True)
 
 def ensure_pydeps():
     import importlib
     try: importlib.import_module("scapy.all")
     except Exception:
-        _pip_install("scapy"); importlib.import_module("scapy.all")
+        _pip_install("scapy"); import importlib as _; _.import_module("scapy.all")
     try: importlib.import_module("cryptography.hazmat.primitives.ciphers.aead")
     except Exception:
         _pip_install("cryptography")
+
 ensure_pydeps()
 from scapy.all import sniff, TCP, IP
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # ===================== Utils =====================
 def which(x): return shutil.which(x) is not None
+
 def run(*cmd, check=True, quiet=False):
     res = subprocess.run(list(cmd), text=True, capture_output=True)
     if not quiet and res.stdout.strip(): print(res.stdout.rstrip())
@@ -73,11 +63,11 @@ def must_root():
 
 def log_event(ev):
     ev = {"ts": f"{time.time():.3f}", **ev}
-    with open(JSONL_PATH, "a") as f: f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-    shown = {k: v for k, v in ev.items() if k not in ("ts",)}
+    with open(JSONL_PATH,"a") as f: f.write(json.dumps(ev, ensure_ascii=False)+"\n")
+    shown = {k:v for k,v in ev.items() if k not in ("ts",)}
     print(f"[{ev['event']}] {shown}")
 
-# ----- Secrets (lecture tolérante) -----
+# ----- Secrets (lecture tolérante + chown correct) -----
 def b64_read_tolerant(raw: str) -> bytes:
     token = raw.strip().split()[0] if raw.strip() else ""
     try:
@@ -94,31 +84,37 @@ def load_or_create_master_secret(path=MASTER_SECRET_PATH) -> bytes:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if not os.path.exists(path):
         raw = secrets.token_bytes(32)
-        with open(path, "w") as f: f.write(base64.b64encode(raw).decode() + "\n")
+        with open(path,"w") as f:
+            f.write(base64.b64encode(raw).decode()+"\n")
         os.chmod(path, 0o600)
         print(f"[+] Secret maître généré : {path}")
     else:
         print(f"[i] Secret maître : {path}")
-    with open(path, "r") as f:
+    with open(path,"r") as f:
         sec = b64_read_tolerant(f.read())
     if len(sec) < 16:
         raise SystemExit("[ERREUR] Secret trop court (<16 octets).")
     return sec
 
 def copy_secret_for_user(secret_b64: str):
+    # Qui est l’utilisateur humain ? (support sudo)
     sudo_user = os.environ.get("SUDO_USER") or getpass.getuser()
     try:
-        pw = pwd.getpwnam(sudo_user); home = pw.pw_dir
+        pw = pwd.getpwnam(sudo_user)
+        home, uid, gid = pw.pw_dir, pw.pw_uid, pw.pw_gid
     except Exception:
-        home = os.path.expanduser("~"); pw = None
+        home = os.path.expanduser("~"); uid = gid = None
+
     dst = USER_COPY_PATH_FMT.format(home=home)
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    with open(dst, "w") as f: f.write(secret_b64 + "\n")
+    with open(dst,"w") as f: f.write(secret_b64 + "\n")
     os.chmod(dst, 0o600)
-    # *** Correctif : remettre la propriété à l'utilisateur ***
-    if pw:
-        try: os.chown(dst, pw.pw_uid, pw.pw_gid)
-        except PermissionError: pass
+    # <<< correctif demandé : donne la bonne propriété au fichier >>>
+    try:
+        if uid is not None and gid is not None:
+            os.chown(dst, uid, gid)
+    except PermissionError:
+        pass
     print(f"[i] Copie du secret pour {sudo_user}: {dst}")
 
 def epoch_window(ts=None):
@@ -129,14 +125,14 @@ def derive_sequence(secret: bytes, ip: str, win: int):
     rng = MAX_PORT - MIN_PORT + 1
     digest = hmac.new(secret, f"{ip}|{win}".encode(), hashlib.sha256).digest()
     ports, i = [], 0
-    while len(ports) < SEQUENCE_LEN and i + 2 <= len(digest):
+    while len(ports) < SEQUENCE_LEN and i+2 <= len(digest):
         val = int.from_bytes(digest[i:i+2], "big")
-        p = MIN_PORT + (val % rng)
+        p   = MIN_PORT + (val % rng)
         if p not in ports: ports.append(p)
         i += 2
     while len(ports) < SEQUENCE_LEN:
         digest = hashlib.sha256(digest).digest()
-        p = MIN_PORT + (int.from_bytes(digest[:2], "big") % rng)
+        p = MIN_PORT + (int.from_bytes(digest[:2],"big") % rng)
         if p not in ports: ports.append(p)
     return ports
 
@@ -147,6 +143,7 @@ def derive_spa_key(secret: bytes, ip: str, win: int) -> bytes:
 _sshd_proc = None
 def ensure_host_keys():
     run("bash","-lc","test -f /etc/ssh/ssh_host_ed25519_key || ssh-keygen -A", check=False, quiet=True)
+
 def start_ephemeral_sshd():
     global _sshd_proc
     ensure_host_keys()
@@ -160,9 +157,8 @@ PidFile /tmp/poc2_sshd.pid
 LogLevel QUIET
 """
     path = "/tmp/poc2_sshd_config"
-    with open(path, "w") as f: f.write(cfg)
-    _sshd_proc = subprocess.Popen(["/usr/sbin/sshd","-f",path],
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with open(path,"w") as f: f.write(cfg)
+    _sshd_proc = subprocess.Popen(["/usr/sbin/sshd","-f",path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print(f"[+] sshd éphémère sur {SSH_LISTEN}:{SSH_PORT}")
 
 def stop_ephemeral_sshd():
@@ -179,16 +175,13 @@ set_installed  = False
 
 def iptables_insert_drop():
     global drop_rule_installed
-    run("bash","-lc", f"iptables -C INPUT -p tcp --dport {SSH_PORT} -j DROP 2>/dev/null || "
-                      f"iptables -I INPUT -p tcp --dport {SSH_PORT} -j DROP")
+    run("bash","-lc", f"iptables -C INPUT -p tcp --dport {SSH_PORT} -j DROP 2>/dev/null || iptables -I INPUT -p tcp --dport {SSH_PORT} -j DROP")
     drop_rule_installed = True
 
 def ipset_prepare():
     global set_installed
-    run("bash","-lc", f"ipset list {IPSET_NAME} >/dev/null 2>&1 || "
-                      f"ipset create {IPSET_NAME} hash:ip timeout {QUARANTINE_TIMEOUT}")
-    run("bash","-lc", f"iptables -C INPUT -m set --match-set {IPSET_NAME} src -j DROP 2>/dev/null || "
-                      f"iptables -I INPUT -m set --match-set {IPSET_NAME} src -j DROP")
+    run("bash","-lc", f"ipset list {IPSET_NAME} >/dev/null 2>&1 || ipset create {IPSET_NAME} hash:ip timeout {QUARANTINE_TIMEOUT}")
+    run("bash","-lc", f"iptables -C INPUT -m set --match-set {IPSET_NAME} src -j DROP 2>/dev/null || iptables -I INPUT -m set --match-set {IPSET_NAME} src -j DROP")
     set_installed = True
 
 def accept_for_ip(ip):
@@ -200,6 +193,9 @@ def remove_accept_for_ip(ip):
     added_accept_rules.discard(ip)
 
 def quarantine_ip(ip):
+    # petit confort : on évite de mettre 127.0.0.1 en quarantaine (démos locales)
+    if ip == "127.0.0.1":
+        return
     run("bash","-lc", f"ipset add {IPSET_NAME} {ip} timeout {QUARANTINE_TIMEOUT}", check=False)
 
 def cleanup():
@@ -214,7 +210,6 @@ def cleanup():
     print("\n[ Règles pertinentes ]"); run(*PRINT_RULES_CMD, check=False)
 
 # ===================== États + SPA =====================
-SECRET = b""  # injecté dans main()
 states = {}      # ip -> {progress,last_ts,last_port,win,bad}
 pending_spa = {} # ip -> deadline
 used_nonces = {} # nonce_hex -> expiry_ts
@@ -237,30 +232,33 @@ def on_tcp_syn(pkt):
     if not pkt.haslayer(IP) or not pkt.haslayer(TCP): return
     dport = int(pkt[TCP].dport)
     ip    = pkt[IP].src
-    # *** Ne pas ignorer 127.0.0.1 (correctif loopback) ***
+    # <<< correctif demandé : ne pas ignorer 127.0.0.1 en loopback >>> (donc pas de "return" ici)
 
     seqs = valid_sequences_for_ip(ip)
-    st = states.get(ip, {"progress":0, "last_ts":0, "last_port":-1, "win":max(seqs.keys()), "bad":0})
+    st = states.get(ip, {"progress":0,"last_ts":0,"last_port":-1,"win":max(seqs.keys()),"bad":0})
     win = st["win"]; seq = seqs.get(win, seqs[max(seqs.keys())])
     expected = seq[st["progress"]]
     t = now()
 
-    if dport == expected and (t - st["last_ts"] <= MAX_SEQ_JITTER or st["progress"]==0) and dport != st["last_port"]:
+    ok_timing = (t - st["last_ts"] <= MAX_SEQ_JITTER) or st["progress"] == 0
+    ok_port   = (dport == expected) and (dport != st["last_port"])
+
+    if ok_port and ok_timing:
         st.update({"progress": st["progress"]+1, "last_ts": t, "last_port": dport})
         states[ip] = st
         log_event({"event":"step","ip":ip,"received":dport,"expected":expected,"progress":st["progress"]})
         if st["progress"] >= SEQUENCE_LEN:
             log_event({"event":"sequence_ok","ip":ip})
-            states[ip]["progress"] = 0
+            states[ip]["progress"]=0
             pending_spa[ip] = t + SPA_GRACE_S
     else:
         st.update({"progress":0,"last_ts":t,"last_port":dport,"bad": st.get("bad",0)+1})
-        states[ip] = st
+        states[ip]=st
         log_event({"event":"invalid_seq","ip":ip,"count":st["bad"]})
         if st["bad"] >= QUARANTINE_THRESHOLD:
             quarantine_ip(ip)
             log_event({"event":"quarantine","ip":ip,"timeout":QUARANTINE_TIMEOUT})
-            st["bad"] = 0
+            st["bad"]=0
 
 def spa_listener(stop_evt):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -278,11 +276,11 @@ def spa_listener(stop_evt):
             log_event({"event":"spa_invalid_format","ip":ip}); continue
 
         iv = data[1:13]; ct = data[13:]
-        payload = None; ok = False
+        payload = None; ok=False
         for w in (epoch_window(), epoch_window()-1):
             key = derive_spa_key(SECRET, ip, w)
             try:
-                payload = AESGCM(key).decrypt(iv, ct, None); ok = True; break
+                payload = AESGCM(key).decrypt(iv, ct, None); ok=True; break
             except Exception:
                 continue
         if not ok:
@@ -297,11 +295,12 @@ def spa_listener(stop_evt):
         if seen_nonce(nonce):
             log_event({"event":"replay_spa","ip":ip}); continue
         mark_nonce(nonce)
+
         ts = obj.get("ts",0)
         if abs(now()-ts) > SPA_TTL_S:
             log_event({"event":"spa_expired","ip":ip}); continue
 
-        # OK => ouverture ciblée
+        # OK => ouverture
         accept_for_ip(ip)
         print("\n[ Règles pertinentes ]"); run(*PRINT_RULES_CMD, check=False)
         dur = int(obj.get("duration", OPEN_DURATION))
@@ -327,11 +326,11 @@ def main():
     global SECRET
     must_root(); ensure_system_deps()
 
-    ap = argparse.ArgumentParser(description="POC2 Serveur — Séquence HMAC + SPA AES-GCM")
+    ap = argparse.ArgumentParser(description="POC2 Serveur — Séquence HMAC dynamique + SPA AES-GCM")
     ap.add_argument("-i","--iface", default=IFACE_DEFAULT, help=f"Interface à sniffer (défaut: {IFACE_DEFAULT})")
     args = ap.parse_args()
 
-    # Secret maître
+    # Secret maître + copie pour l’utilisateur humain (chown)
     SECRET = load_or_create_master_secret()
     copy_secret_for_user(base64.b64encode(SECRET).decode())
 
@@ -340,7 +339,7 @@ def main():
     ipset_prepare()
 
     print(f"[i] Interface: {args.iface} | SSH protégé: {SSH_LISTEN}:{SSH_PORT}")
-    print(f"[i] Fenêtre knocks: {KNOCKS_WINDOW_S}s (tolère N-1) | SPA UDP: {SSH_LISTEN}:{SPA_PORT}")
+    print(f"[i] Fenêtre knocks: {KNOCKS_WINDOW_S}s | SPA UDP: {SSH_LISTEN}:{SPA_PORT}")
     print("\n[ Règles pertinentes ]"); run(*PRINT_RULES_CMD, check=False)
 
     stop_evt = threading.Event()
