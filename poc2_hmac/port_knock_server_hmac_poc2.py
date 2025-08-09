@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, sys, time, json, hmac, hashlib, base64, signal, shutil, subprocess, threading, socket, argparse
-from datetime import datetime, timedelta
+"""
+POC 2 — Serveur
+- Séquence de knocks DYNAMIQUE dérivée par HMAC(secret, IP|fenêtre)
+- SPA chiffré AES-GCM (clé dérivée par HMAC) avec nonce anti-rejeu
+- Invisibilité par DROP défaut sur 2222 + ACCEPT ciblé
+- Quarantaine ipset après 3 erreurs
+- Logs JSONL
+"""
 
-# ========== Paramètres (modifiables) ==========
-DEMO_SECRET_B64 = "MDEyMzQ1Njc4OUFCQ0RFRjAxMjM0NTY3ODlBQkNERUY="  # "0123456789ABCDEF0123456789ABCDEF" (base64)
+import os, sys, time, json, hmac, hashlib, base64, signal, shutil, subprocess, threading, socket, argparse
+from datetime import datetime
+
+# ========== Paramètres ==========
+DEMO_SECRET_B64 = "MDEyMzQ1Njc4OUFCQ0RFRjAxMjM0NTY3ODlBQkNERUY="  # "0123456789ABCDEF0123456789ABCDEF"
 SSH_PORT        = 2222
 SSH_LISTEN      = "127.0.0.1"
 WINDOW_SECONDS  = 30
@@ -16,17 +25,16 @@ MAX_SEQ_JITTER  = 10
 SPA_PORT        = 45444
 SPA_GRACE_SECONDS = 10
 NONCE_TTL       = 120
-OPEN_DURATION   = 0     # 0 = illimité tant que le serveur tourne
+OPEN_DURATION   = 0
 QUARANTINE_THRESHOLD = 3
 QUARANTINE_TIMEOUT   = 60
 IPSET_NAME      = "knock_quarantine"
 JSONL_PATH      = "knockd_poc2.jsonl"
 PRINT_RULES_CMD = ["bash","-lc", "iptables-save | egrep '2222|knock_quarantine' || true"]
 
-# ========== Auto-install Python deps ==========
+# ========== Dépendances Python ==========
 def _pip_install(pkg):
     subprocess.run([sys.executable,"-m","pip","install","-q",pkg], check=True)
-
 def ensure_python_deps():
     import importlib
     try: importlib.import_module("scapy.all")
@@ -39,32 +47,29 @@ ensure_python_deps()
 from scapy.all import sniff, TCP, IP
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-# ========== Vérifs système / auto-install ==========
+# ========== Vérifs système ==========
 def which(x): return shutil.which(x) is not None
-
-def apt_like():   return which("apt") or which("apt-get")
-def dnf_like():   return which("dnf") or which("yum")
-def pacman_like():return which("pacman")
+def apt_like(): return which("apt") or which("apt-get")
+def dnf_like(): return which("dnf") or which("yum")
+def pacman_like(): return which("pacman")
 
 def auto_install_pkgs(pkgs):
     if os.geteuid() != 0:
         print("[!] Dépendances manquantes:", ", ".join(pkgs))
-        print("    Lance en root OU installe manuellement. Exemples :")
-        if apt_like():    print("    sudo apt install -y " + " ".join(pkgs))
-        elif dnf_like():  print("    sudo dnf install -y " + " ".join(pkgs))
-        elif pacman_like(): print("    sudo pacman -S --noconfirm " + " ".join(pkgs))
-        else:             print("    Installe ces paquets via ton gestionnaire (iptables, ipset, openssh-server, nmap).")
+        print("    Lance en root OU installe manuellement.")
+        if   apt_like():   print("    sudo apt install -y " + " ".join(pkgs))
+        elif dnf_like():   print("    sudo dnf install -y " + " ".join(pkgs))
+        elif pacman_like():print("    sudo pacman -S --noconfirm " + " ".join(pkgs))
         sys.exit(1)
-    # root => tentative d’install
     cmd = None
-    if apt_like():      cmd = ["bash","-lc","apt-get update -y >/dev/null 2>&1 && apt-get install -y " + " ".join(pkgs)]
+    if   apt_like():    cmd = ["bash","-lc","apt-get update -y >/dev/null 2>&1 && apt-get install -y " + " ".join(pkgs)]
     elif dnf_like():    cmd = ["bash","-lc","dnf install -y " + " ".join(pkgs)]
     elif pacman_like(): cmd = ["bash","-lc","pacman -Sy --noconfirm " + " ".join(pkgs)]
     if cmd:
         print("[i] Installation automatique des paquets : " + " ".join(pkgs))
         subprocess.run(cmd, check=True)
     else:
-        print("[!] Gestionnaire inconnu, installe manuellement :", " ".join(pkgs)); sys.exit(1)
+        print("[!] Installe manuellement :", " ".join(pkgs)); sys.exit(1)
 
 def ensure_system_deps():
     need = []
@@ -77,9 +82,8 @@ ensure_system_deps()
 def log_event(ev):
     ev = {"ts": f"{time.time():.3f}", **ev}
     with open(JSONL_PATH,"a") as f: f.write(json.dumps(ev, ensure_ascii=False)+"\n")
-    # petite sortie lisible
-    tag = next(iter(ev.get("event","").split()))
-    print(f"[{ev['event']}] { {k:v for k,v in ev.items() if k!='event' and k!='ts'} }")
+    # sortie lisible
+    print(f"[{ev['event']}] { {k:v for k,v in ev.items() if k not in ('event','ts')} }")
 
 def derive_secret():
     b64 = os.environ.get("KNOCK_SECRET", DEMO_SECRET_B64)
@@ -91,10 +95,7 @@ def derive_secret():
         print("[ERREUR] Secret invalide (base64).", e); sys.exit(1)
 
 SECRET = derive_secret()
-
-def epoch_window(ts=None):
-    if ts is None: ts = time.time()
-    return int(ts // WINDOW_SECONDS)
+def epoch_window(ts=None): return int((ts if ts is not None else time.time()) // WINDOW_SECONDS)
 
 def derive_sequence(secret: bytes, ip: str, win: int):
     rng = MAX_PORT - MIN_PORT + 1
@@ -114,12 +115,10 @@ def derive_sequence(secret: bytes, ip: str, win: int):
 def derive_spa_key(secret: bytes, ip: str, win: int)->bytes:
     return hmac.new(secret, f"spa|{ip}|{win}".encode(), hashlib.sha256).digest()
 
-# ========== sshd éphémère 127.0.0.1:2222 ==========
+# ========== sshd éphémère ==========
 _sshd_proc = None
 def ensure_host_keys():
-    # génère les clés si absentes
     subprocess.run(["bash","-lc","test -f /etc/ssh/ssh_host_ed25519_key || ssh-keygen -A"], check=True)
-
 def start_ephemeral_sshd():
     global _sshd_proc
     ensure_host_keys()
@@ -130,15 +129,14 @@ Protocol 2
 UsePAM no
 PasswordAuthentication no
 PubkeyAuthentication yes
-KexAlgorithms +sntrup761x25519-sha512@openssh.com
 PidFile /tmp/poc2_sshd.pid
 LogLevel QUIET
 """
-    path = "/tmp/poc2_sshd_config"
-    with open(path,"w") as f: f.write(cfg)
-    _sshd_proc = subprocess.Popen(["/usr/sbin/sshd","-f",path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    cfg_path = "/tmp/poc2_sshd_config"
+    with open(cfg_path,"w") as f: f.write(cfg)
+    _sshd_proc = subprocess.Popen(["/usr/sbin/sshd","-f",cfg_path],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print(f"[+] Démarrage d'un sshd éphémère sur {SSH_LISTEN}:{SSH_PORT} …")
-
 def stop_ephemeral_sshd():
     if _sshd_proc and _sshd_proc.poll() is None:
         _sshd_proc.terminate()
@@ -146,8 +144,8 @@ def stop_ephemeral_sshd():
         except: _sshd_proc.kill()
         print("[i] sshd éphémère arrêté.")
 
-# ========== iptables/ipset (invisibilité + quarantaine) ==========
-added_accept_rules = set()  # {ip}
+# ========== iptables/ipset ==========
+added_accept_rules = set()
 drop_rule_installed = False
 set_installed = False
 
@@ -155,7 +153,8 @@ def run(*cmd, check=True, quiet=False):
     res = subprocess.run(list(cmd), text=True, capture_output=True)
     if not quiet and res.stdout.strip(): print(res.stdout.rstrip())
     if check and res.returncode != 0:
-        print(res.stderr); raise subprocess.CalledProcessError(res.returncode, cmd)
+        if res.stderr: print(res.stderr.rstrip())
+        raise subprocess.CalledProcessError(res.returncode, cmd)
     return res
 
 def iptables_insert_drop():
@@ -194,21 +193,17 @@ def cleanup():
     print("[i] État final des règles :")
     run(*PRINT_RULES_CMD, check=False)
 
-# ========== Machine d'états (knocks) + SPA ==========
-states = {}      # ip => {"progress":0..3, "last_ts":float, "last_port":int, "win":int, "bad":int}
-pending_spa = {} # ip => deadline (time)
-used_nonces = {} # nonce hex -> expiry
-
+# ========== Machine d'états + SPA ==========
+states = {}      # ip => {progress,last_ts,last_port,win,bad}
+pending_spa = {} # ip => deadline
+used_nonces = {} # nonce -> expiry
 def now(): return time.time()
 
 def forget_expired_nonces():
     t = now()
     for k,exp in list(used_nonces.items()):
         if exp < t: del used_nonces[k]
-
-def mark_nonce(nonce_hex):
-    used_nonces[nonce_hex] = now() + NONCE_TTL
-
+def mark_nonce(nonce_hex): used_nonces[nonce_hex] = now() + NONCE_TTL
 def check_nonce(nonce_hex)->bool:
     forget_expired_nonces()
     return nonce_hex in used_nonces
@@ -226,7 +221,6 @@ def on_tcp_syn(pkt):
     seqs = valid_sequences_for_ip(ip)
     st = states.get(ip, {"progress":0,"last_ts":0,"last_port":-1,"win":None,"bad":0})
     win = st["win"]
-    # (ré)aligner sur la bonne fenêtre si besoin
     if win not in seqs: win = max(seqs.keys())
     seq = seqs[win]
     expected_port = seq[st["progress"]]
@@ -281,18 +275,15 @@ def spa_listener(stop_evt):
         if check_nonce(nonce):
             log_event({"event":"replay_spa","ip":ip}); continue
         mark_nonce(nonce)
-        # basic TTL
         if abs(now()-obj.get("ts",0)) > NONCE_TTL:
             log_event({"event":"spa_expired","ip":ip}); continue
         # OK → ouverture
         accept_for_ip(ip)
-        print("\n[ Règles pertinentes ]")
-        run(*PRINT_RULES_CMD, check=False)
+        print("\n[ Règles pertinentes ]"); run(*PRINT_RULES_CMD, check=False)
         dur = obj.get("duration", OPEN_DURATION)
         log_event({"event":"open","ip":ip,"port":SSH_PORT,"duration": "infinite" if dur==0 else dur})
         if dur and dur>0:
             threading.Thread(target=_delayed_close, args=(ip,dur), daemon=True).start()
-        # ce SPA est consommé
         del pending_spa[ip]
     s.close()
 
@@ -300,8 +291,7 @@ def _delayed_close(ip, delay):
     time.sleep(delay)
     remove_accept_for_ip(ip)
     log_event({"event":"close","ip":ip,"port":SSH_PORT})
-    print("\n[ Règles pertinentes ]")
-    run(*PRINT_RULES_CMD, check=False)
+    print("\n[ Règles pertinentes ]"); run(*PRINT_RULES_CMD, check=False)
 
 # ========== main ==========
 def must_root():
@@ -310,7 +300,7 @@ def must_root():
 
 def main():
     must_root()
-    ap = argparse.ArgumentParser(description="POC2 Serveur - Knocks HMAC + SPA AES-GCM (auto-deps)")
+    ap = argparse.ArgumentParser(description="POC2 Serveur - Knocks HMAC + SPA AES-GCM")
     ap.add_argument("-i","--iface", default="lo", help="Interface à sniffer (défaut: lo)")
     args = ap.parse_args()
 
@@ -318,15 +308,15 @@ def main():
     iptables_insert_drop()
     ipset_prepare()
 
-    print("[i] Écoute sur", args.iface, "| séquence: dynamique HMAC(IP, fenêtre)", f"| port à ouvrir: {SSH_PORT} (∞ si OPEN_DURATION=0)")
-    print("\n[ Règles pertinentes ]")
-    run(*PRINT_RULES_CMD, check=False)
+    print(f"[i] Écoute sur {args.iface} | séquence: dynamique HMAC(IP, fenêtre) | port à ouvrir: {SSH_PORT} (∞ si OPEN_DURATION=0)")
+    print("\n[ Règles pertinentes ]"); run(*PRINT_RULES_CMD, check=False)
 
     stop_evt = threading.Event()
     t_spa = threading.Thread(target=spa_listener, args=(stop_evt,), daemon=True)
     t_spa.start()
 
-    bpf = "tcp[tcpflags] & tcp-syn != 0"
+    # BPF propre : SYN sans ACK (évite de compter les SYN/ACK)
+    bpf = "tcp[13] & 0x12 = 0x02"
     try:
         sniff(filter=bpf, prn=on_tcp_syn, store=0, iface=args.iface)
     except KeyboardInterrupt:
