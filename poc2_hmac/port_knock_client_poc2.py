@@ -58,7 +58,7 @@ def derive_spa_key(secret: bytes, ip: str, win: int) -> bytes:
 # --------- Réseau ----------
 def send_syn(host, port, timeout=1.0):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(timeout)
-    try: s.connect((host, port))
+    try: s.connect((host, port))   # émet un SYN ; OSError attendu si rien n’écoute
     except OSError: pass
     finally: s.close()
 
@@ -101,7 +101,6 @@ def main():
     args = ap.parse_args()
 
     secret = load_secret(file_path=args.secret_file)
-
     server = args.server
     client_ip = "127.0.0.1" if server in ("127.0.0.1","localhost") else socket.gethostbyname(socket.gethostname())
 
