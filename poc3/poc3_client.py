@@ -1,36 +1,52 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-POC3 Client 
- calcule la séquence TOTP/HMAC et "frappe" les ports, puis SSH.
+POC3 - Client port-knocking (compatible serveur nftables).
+- Calcule la séquence en HMAC(secret, window)
+- Frappe P1 -> P2 -> P3 en TCP SYN (bloque pas en cas d'échec)
+- Ouvre SSH automatiquement si demandé
 """
-import os, sys, time, hmac, base64, hashlib, socket, argparse, getpass, subprocess
 
-WINDOW_SECONDS     = 30
-SEQUENCE_LEN       = 3
+import os, sys, time, hmac, hashlib, base64, socket, argparse, subprocess, getpass, binascii
+
+SSH_PORT        = 2222
+SSH_LISTEN      = "127.0.0.1"
+WINDOW_SECONDS  = 30
+SEQUENCE_LEN    = 3
 MIN_PORT, MAX_PORT = 40000, 50000
-STEP_DELAY         = 0.5
-SSH_PORT           = 2222
-DEFAULT_SECRET_FILE= os.path.expanduser("~/.config/portknock/secret")
+STEP_DELAY      = 0.5
 
-def load_secret(path=DEFAULT_SECRET_FILE) -> bytes:
-    if not os.path.exists(path):
-        sys.exit(f"[ERREUR] Secret introuvable: {path}")
-    token = open(path).read().strip().split()[0]
+DEFAULT_SECRET_FILE = os.path.expanduser("~/.config/portknock/secret")
+
+# ------------- Secret -------------
+def b64_read_tolerant(raw: str) -> bytes:
+    token = raw.strip().split()[0] if raw.strip() else ""
     try:
-        return base64.b64decode(token, validate=False)
+        return base64.b64decode(token, validate=True)
     except Exception:
-        sys.exit("[ERREUR] Secret local invalide (base64).")
+        data = base64.b64decode(token)
+        if not data: raise ValueError("secret vide")
+        return data
 
-def epoch_window(ts=None):
+def load_secret(env_var="KNOCK_SECRET_B64", file_path=DEFAULT_SECRET_FILE) -> bytes:
+    if os.environ.get(env_var):
+        return b64_read_tolerant(os.environ[env_var])
+    if os.path.exists(file_path):
+        with open(file_path,"r") as f:
+            return b64_read_tolerant(f.read())
+    print(f"[ERREUR] Secret introuvable. Exporte {env_var} ou crée {file_path}")
+    sys.exit(1)
+
+# ------------- Séquence -------------
+def current_window(ts=None):
     if ts is None: ts = time.time()
     return int(ts // WINDOW_SECONDS)
 
 def derive_sequence(secret: bytes, win: int):
     rng = MAX_PORT - MIN_PORT + 1
-    digest = hmac.new(secret, f"W{win}".encode(), hashlib.sha256).digest()
+    digest = hmac.new(secret, str(win).encode(), hashlib.sha256).digest()
     ports, i = [], 0
-    while len(ports) < SEQUENCE_LEN and i+2 <= len(digest):
+    while len(ports) < SEQUENCE_LEN and i + 2 <= len(digest):
         val = int.from_bytes(digest[i:i+2], "big")
         p   = MIN_PORT + (val % rng)
         if p not in ports: ports.append(p)
@@ -41,46 +57,63 @@ def derive_sequence(secret: bytes, win: int):
         if p not in ports: ports.append(p)
     return ports
 
+# ------------- Réseau -------------
 def send_syn(host, port, timeout=1.0):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(timeout)
-    try: s.connect((host, port))
-    except OSError: pass
-    finally: s.close()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, port))
+    except OSError:
+        pass
+    finally:
+        s.close()
 
 def ensure_local_ssh_key():
-    home = os.path.expanduser("~"); d = os.path.join(home, ".ssh")
-    priv = os.path.join(d, "id_ed25519"); pub = priv + ".pub"; auth = os.path.join(d, "authorized_keys")
-    os.makedirs(d, exist_ok=True)
+    home = os.path.expanduser("~"); sshd = os.path.join(home, ".ssh")
+    priv = os.path.join(sshd, "id_ed25519"); pub = priv + ".pub"; auth = os.path.join(sshd, "authorized_keys")
+    os.makedirs(sshd, exist_ok=True)
     if not os.path.exists(priv):
         subprocess.run(["ssh-keygen","-q","-t","ed25519","-N","","-f",priv], check=True)
     if not os.path.exists(pub):
-        subprocess.run(["ssh-keygen","-y","-f",priv], stdout=open(pub,"w"), check=True)
-    if not os.path.exists(auth) or open(pub).read().strip() not in open(auth).read():
-        with open(auth,"a") as f: f.write(open(pub).read().strip()+"\n")
+        subprocess.run(["ssh-keygen","-y","-f",priv], check=True, stdout=open(pub,"w"))
+    key = open(pub).read().strip()
+    if not os.path.exists(auth) or key not in open(auth).read():
+        with open(auth,"a") as f: f.write(key+"\n")
         os.chmod(auth, 0o600)
 
+# ------------- Main -------------
 def main():
-    ap = argparse.ArgumentParser(description="POC3 Client — knock TOTP/HMAC + SSH")
-    ap.add_argument("server", nargs="?", default="127.0.0.1", help="IP/nom du serveur")
-    ap.add_argument("--window-offset", type=int, default=0, help="0 = fenêtre courante, -1 = précédente")
-    ap.add_argument("--no-ssh", action="store_true", help="Ne pas lancer SSH")
+    ap = argparse.ArgumentParser(description="POC3 Client - port-knocking dynamique (nftables)")
+    ap.add_argument("server", nargs="?", default=SSH_LISTEN, help="IP/nom du serveur (défaut: 127.0.0.1)")
+    ap.add_argument("--no-ssh", action="store_true", help="Ne pas lancer SSH après les knocks")
+    ap.add_argument("--delay", type=float, default=STEP_DELAY, help="Délai entre knocks (défaut: 0.5s)")
+    ap.add_argument("--secret-file", default=DEFAULT_SECRET_FILE, help=f"Chemin du secret (défaut: {DEFAULT_SECRET_FILE})")
     args = ap.parse_args()
 
-    secret = load_secret()
-    w = epoch_window() + args.window_offset
+    secret = load_secret(file_path=args.secret_file)
+    server = args.server
+    client_ip = "127.0.0.1" if server in ("127.0.0.1","localhost") else socket.gethostbyname(socket.gethostname())
+
+    w   = current_window()
     seq = derive_sequence(secret, w)
-    print(f"[i] Séquence: {' => '.join(map(str,seq))} (fenêtre {w}, {WINDOW_SECONDS}s)")
+
+    print(f"[i] Cible: {server} | Fenêtre: {w} ({WINDOW_SECONDS}s) | Séquence: {' -> '.join(map(str, seq))} | Délai: {args.delay}s")
 
     for p in seq:
-        print(f"[*] Knock {p}")
-        send_syn(args.server, p); time.sleep(STEP_DELAY)
+        print(f"[*] Knock sur le port {p}")
+        send_syn(server, p); time.sleep(args.delay)
 
-    if args.no_ssh:
+    if args.no-ssh:
         return
-    try: ensure_local_ssh_key()
-    except Exception as e: print(f"[!] ssh-key: {e}")
+
+    try:
+        ensure_local_ssh_key()
+    except Exception as e:
+        print(f"[!] Clé SSH locale: {e}")
+
     user = getpass.getuser()
-    os.execvp("ssh", ["ssh","-p",str(SSH_PORT),"-o","StrictHostKeyChecking=accept-new", f"{user}@{args.server}"])
+    print("[✓] Knocks envoyés. Connexion SSH automatique…")
+    os.execvp("ssh", ["ssh","-p",str(SSH_PORT),"-o","StrictHostKeyChecking=accept-new",f"{user}@{server}"])
 
 if __name__ == "__main__":
     main()
