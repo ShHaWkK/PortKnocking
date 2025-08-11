@@ -19,7 +19,7 @@ SPA_PORT           = 45444
 SECRET_FILE = os.path.expanduser("~/.config/portknock/secret")
 TOTP_FILE   = os.path.expanduser("~/.config/portknock/totp")
 
-# ——— Dépendances ———
+# ------- Dépendances -------
 def _pip_install(pkg: str):
     try:
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg], check=True)
@@ -51,7 +51,7 @@ def ensure_pydeps():
         ok = _pip_install("pyotp") or _apt_install("python3-pyotp") or ok
     return ok
 
-# ——— Utils ———
+# ------- Utils -------
 def load_secret(path=SECRET_FILE) -> bytes:
     if not os.path.exists(path):
         raise SystemExit(f"[ERREUR] Secret introuvable : {path}")
@@ -105,7 +105,7 @@ def ensure_local_ssh_key():
         with open(auth,"a") as f: f.write(key+"\n")
         os.chmod(auth, 0o600)
 
-# ——— SPA ———
+# ------- SPA -------
 def build_spa_packet(secret: bytes, server_ip: str, client_ip: str, duration: int, totp_b32: str) -> bytes:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     import pyotp
@@ -127,7 +127,7 @@ def send_spa(pkt: bytes, server_ip: str):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.sendto(pkt, (server_ip, SPA_PORT)); s.close()
 
-# ——— Main ———
+# ------- Main -------
 def main():
     ensure_pydeps()
 
