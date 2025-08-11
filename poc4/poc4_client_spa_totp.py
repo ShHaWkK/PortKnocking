@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-POC4 (client) — knocks HMAC (3 SYN) + SPA AES-GCM + TOTP, puis SSH auto
-Lance: python3 poc4_client_spa_totp.py 127.0.0.1
+POC4 (client) — knocks HMAC (3 SYN) + SPA AES-GCM + TOTP + SSH auto
+Usage: python3 poc4_client_spa_totp.py 127.0.0.1
 """
 
-import os, sys, time, hmac, hashlib, base64, secrets, subprocess, getpass, argparse, json, socket, shutil
+import os, sys, time, hmac, hashlib, base64, secrets, subprocess, getpass
+import argparse, json, socket, shutil
 
 SSH_PORT           = 2222
 SSH_LISTEN         = "127.0.0.1"
@@ -18,7 +19,7 @@ SPA_PORT           = 45444
 SECRET_FILE = os.path.expanduser("~/.config/portknock/secret")
 TOTP_FILE   = os.path.expanduser("~/.config/portknock/totp")
 
-# --------------- Dépendances ---------------
+# ——— Dépendances ———
 def _pip_install(pkg: str):
     try:
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg], check=True)
@@ -29,7 +30,8 @@ def _pip_install(pkg: str):
 def _apt_install(*pkgs: str):
     if not shutil.which("apt"): return False
     try:
-        subprocess.run(["sudo","apt","update"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["sudo","apt","update"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["sudo","apt","install","-y",*pkgs], check=False)
         return True
     except Exception:
@@ -38,18 +40,18 @@ def _apt_install(*pkgs: str):
 def ensure_pydeps():
     ok = True
     try:
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: F401
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa
     except Exception:
-        print("[i] cryptography manquante → installation…")
+        print("[i] Installation cryptography…")
         ok = _pip_install("cryptography") or _apt_install("python3-cryptography") or ok
     try:
-        import pyotp  # noqa: F401
+        import pyotp  # noqa
     except Exception:
-        print("[i] pyotp manquante → installation…")
+        print("[i] Installation pyotp…")
         ok = _pip_install("pyotp") or _apt_install("python3-pyotp") or ok
     return ok
 
-# --------------- Utilitaires ---------------
+# ——— Utils ———
 def load_secret(path=SECRET_FILE) -> bytes:
     if not os.path.exists(path):
         raise SystemExit(f"[ERREUR] Secret introuvable : {path}")
@@ -64,9 +66,7 @@ def load_totp_b32(path=TOTP_FILE) -> str:
         raise SystemExit(f"[ERREUR] Clé TOTP introuvable : {path}")
     return open(path).read().strip().split()[0]
 
-def epoch_window(ts=None):
-    if ts is None: ts = time.time()
-    return int(ts // WINDOW_SECONDS)
+def epoch_window(ts=None): return int((ts or time.time()) // WINDOW_SECONDS)
 
 def derive_sequence(secret: bytes, win: int):
     rng = MAX_PORT - MIN_PORT + 1
@@ -93,9 +93,9 @@ def send_syn(host, port, timeout=1.0):
     finally: s.close()
 
 def ensure_local_ssh_key():
-    home = os.path.expanduser("~"); sshd = os.path.join(home, ".ssh")
-    priv = os.path.join(sshd, "id_ed25519"); pub = priv + ".pub"; auth = os.path.join(sshd, "authorized_keys")
-    os.makedirs(sshd, exist_ok=True)
+    home = os.path.expanduser("~"); d = os.path.join(home, ".ssh")
+    priv = os.path.join(d, "id_ed25519"); pub = priv + ".pub"; auth = os.path.join(d, "authorized_keys")
+    os.makedirs(d, exist_ok=True)
     if not os.path.exists(priv):
         subprocess.run(["ssh-keygen","-q","-t","ed25519","-N","","-f",priv], check=True)
     if not os.path.exists(pub):
@@ -105,25 +105,21 @@ def ensure_local_ssh_key():
         with open(auth,"a") as f: f.write(key+"\n")
         os.chmod(auth, 0o600)
 
-# --------------- SPA ---------------
+# ——— SPA ———
 def build_spa_packet(secret: bytes, server_ip: str, client_ip: str, duration: int, totp_b32: str) -> bytes:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     import pyotp
     code = pyotp.TOTP(totp_b32).now()
     payload = {
-        "req":"open",
-        "port": SSH_PORT,
-        "ts":   int(time.time()),
-        "nonce": secrets.token_hex(12),
-        "totp": code,
-        "duration": int(duration)
+        "req":"open", "port": SSH_PORT,
+        "ts": int(time.time()), "nonce": secrets.token_hex(12),
+        "totp": code, "duration": int(duration),
     }
     raw = json.dumps(payload, separators=(",",":")).encode()
     w   = epoch_window()
     key = derive_spa_key(secret, client_ip, w)
     iv  = os.urandom(12)
     ct  = AESGCM(key).encrypt(iv, raw, None)
-    # On affiche ce qu’on envoie pour la démo
     print(f"[*] TOTP utilisé: {code}")
     return b"\x01" + iv + ct
 
@@ -131,19 +127,19 @@ def send_spa(pkt: bytes, server_ip: str):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.sendto(pkt, (server_ip, SPA_PORT)); s.close()
 
-# --------------- main ---------------
+# ——— Main ———
 def main():
     ensure_pydeps()
 
-    ap = argparse.ArgumentParser(description="POC4 Client — knocks HMAC + SPA AES-GCM + TOTP")
+    ap = argparse.ArgumentParser(description="POC4 Client — knocks HMAC + SPA + TOTP")
     ap.add_argument("server", nargs="?", default=SSH_LISTEN, help="IP/nom du serveur (défaut 127.0.0.1)")
     ap.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="Délai entre knocks (s)")
-    ap.add_argument("--duration", type=int, default=30, help="Durée d’ouverture demandée (s, 0=longue)")
+    ap.add_argument("--duration", type=int, default=30, help="Durée d’ouverture (s, 0=longue)")
     ap.add_argument("--no-ssh", action="store_true", help="Ne pas lancer ssh après SPA")
     args = ap.parse_args()
 
-    secret  = load_secret()
-    totp_b32= load_totp_b32()
+    secret   = load_secret()
+    totp_b32 = load_totp_b32()
 
     server = args.server
     client_ip = "127.0.0.1" if server in ("127.0.0.1","localhost") else socket.gethostbyname(socket.gethostname())
@@ -161,8 +157,7 @@ def main():
     send_spa(pkt, server)
 
     if args.no_ssh:
-        print("[✓] SPA envoyé.")
-        return
+        print("[✓] SPA envoyé."); return
 
     try: ensure_local_ssh_key()
     except Exception as e: print(f"[!] Clé SSH locale: {e}")
