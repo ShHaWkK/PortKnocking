@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-POC3 (client) — envoie la séquence HMAC (3 SYN) puis un SPA AES-GCM + TOTP
-- Récupère le secret HMAC (base64) et la clé TOTP (base32) depuis ~/.config/portknock/
-- Calcule la séquence courante (fenêtre 30s, plage 40000-50000)
-- Frappe les 3 ports, puis envoie un SPA UDP chiffré authentifié (nonce, timestamp, TOTP)
-- Lance ssh -p 2222 automatiquement si --no-ssh n’est pas présent
-- Auto-install des libs Python (cryptography, pyotp)
+POC4 (client) — knocks HMAC (3 SYN) + SPA AES-GCM + TOTP, puis SSH auto
+Lance: python3 poc4_client_spa_totp.py 127.0.0.1
 """
 
 import os, sys, time, hmac, hashlib, base64, secrets, subprocess, getpass, argparse, json, socket, shutil
@@ -22,23 +18,38 @@ SPA_PORT           = 45444
 SECRET_FILE = os.path.expanduser("~/.config/portknock/secret")
 TOTP_FILE   = os.path.expanduser("~/.config/portknock/totp")
 
-# -------------- auto-dépendances --------------
+# --------------- Dépendances ---------------
 def _pip_install(pkg: str):
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg], check=True)
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg], check=True)
+        return True
+    except Exception:
+        return False
+
+def _apt_install(*pkgs: str):
+    if not shutil.which("apt"): return False
+    try:
+        subprocess.run(["sudo","apt","update"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["sudo","apt","install","-y",*pkgs], check=False)
+        return True
+    except Exception:
+        return False
 
 def ensure_pydeps():
+    ok = True
     try:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: F401
     except Exception:
         print("[i] cryptography manquante → installation…")
-        _pip_install("cryptography")
+        ok = _pip_install("cryptography") or _apt_install("python3-cryptography") or ok
     try:
         import pyotp  # noqa: F401
     except Exception:
         print("[i] pyotp manquante → installation…")
-        _pip_install("pyotp")
+        ok = _pip_install("pyotp") or _apt_install("python3-pyotp") or ok
+    return ok
 
-# -------------- utilitaires --------------
+# --------------- Utilitaires ---------------
 def load_secret(path=SECRET_FILE) -> bytes:
     if not os.path.exists(path):
         raise SystemExit(f"[ERREUR] Secret introuvable : {path}")
@@ -94,15 +105,17 @@ def ensure_local_ssh_key():
         with open(auth,"a") as f: f.write(key+"\n")
         os.chmod(auth, 0o600)
 
+# --------------- SPA ---------------
 def build_spa_packet(secret: bytes, server_ip: str, client_ip: str, duration: int, totp_b32: str) -> bytes:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     import pyotp
+    code = pyotp.TOTP(totp_b32).now()
     payload = {
         "req":"open",
         "port": SSH_PORT,
         "ts":   int(time.time()),
         "nonce": secrets.token_hex(12),
-        "totp": pyotp.TOTP(totp_b32).now(),
+        "totp": code,
         "duration": int(duration)
     }
     raw = json.dumps(payload, separators=(",",":")).encode()
@@ -110,25 +123,27 @@ def build_spa_packet(secret: bytes, server_ip: str, client_ip: str, duration: in
     key = derive_spa_key(secret, client_ip, w)
     iv  = os.urandom(12)
     ct  = AESGCM(key).encrypt(iv, raw, None)
+    # On affiche ce qu’on envoie pour la démo
+    print(f"[*] TOTP utilisé: {code}")
     return b"\x01" + iv + ct
 
 def send_spa(pkt: bytes, server_ip: str):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.sendto(pkt, (server_ip, SPA_PORT)); s.close()
 
-# -------------- main --------------
+# --------------- main ---------------
 def main():
     ensure_pydeps()
 
-    ap = argparse.ArgumentParser(description="POC3 Client — knocks HMAC + SPA AES-GCM + TOTP")
+    ap = argparse.ArgumentParser(description="POC4 Client — knocks HMAC + SPA AES-GCM + TOTP")
     ap.add_argument("server", nargs="?", default=SSH_LISTEN, help="IP/nom du serveur (défaut 127.0.0.1)")
     ap.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="Délai entre knocks (s)")
     ap.add_argument("--duration", type=int, default=30, help="Durée d’ouverture demandée (s, 0=longue)")
     ap.add_argument("--no-ssh", action="store_true", help="Ne pas lancer ssh après SPA")
     args = ap.parse_args()
 
-    secret = load_secret()
-    totp_b32 = load_totp_b32()
+    secret  = load_secret()
+    totp_b32= load_totp_b32()
 
     server = args.server
     client_ip = "127.0.0.1" if server in ("127.0.0.1","localhost") else socket.gethostbyname(socket.gethostname())
