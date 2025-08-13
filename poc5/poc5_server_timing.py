@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-POC5 - Serveur
+POC5 - Serveur complet et autonome
 Canal temporel (inter-arrival timing) + SPA AES-GCM + ouverture dynamique via nftables
+Tout est configuré automatiquement : nftables est préparé par le script.
 """
 
 import socket
@@ -18,18 +19,32 @@ from datetime import datetime
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # --- CONFIGURATION ---
-PORT_LEURRE = 443
-PREAMBULE = [1, 0, 1, 0]  # pour synchroniser la séquence
-CLE_AES = b"azertyazertyazertyazertyazertyaz"   # 32 bytes = AES-256
-CLE_HMAC = b"responsresponsresponsrespons"      # clé HMAC
-FENETRE_TEMPS = 60  # en secondes (anti-rejeu)
-DUREE_PAR_DEFAUT = 60  # durée d'ouverture IP
+PORT_LEURRE = 443                     # Port leurre (un seul ouvert)
+PREAMBULE = [1, 0, 1, 0]               # Séquence pour synchronisation
+CLE_AES = b"azertyazertyazertyazertyazertyaz"  # Clé AES-256 (32 octets)
+CLE_HMAC = b"responsresponsresponsrespons"     # Clé HMAC
+FENETRE_TEMPS = 60                     # Anti-rejeu (en secondes)
+DUREE_PAR_DEFAUT = 60                  # Durée d’ouverture IP autorisée
 ips_autorisees = {}
 
-LOG_FILE = "poc5_server.log"  # logs JSONL
-OSCILLOSCOPE = True  # affichage visuel des timings
+LOG_FILE = "poc5_server.log"           # Fichier de logs JSONL
+OSCILLOSCOPE = True                    # Affichage visuel des timings
 
-# --- FONCTIONS ---
+# --- PRÉPARATION NFTABLES ---
+def configurer_nftables():
+    """Crée la configuration nftables complète pour autoriser dynamiquement des IP."""
+    cmds = [
+        "nft add table inet filter",
+        "nft add set inet filter allowed { type ipv4_addr; flags timeout; }",
+        "nft add chain inet filter input { type filter hook input priority 0; }",
+        "nft add rule inet filter input ip saddr @allowed accept",
+        f"nft add rule inet filter input tcp dport {PORT_LEURRE} drop"
+    ]
+    for cmd in cmds:
+        subprocess.run(cmd, shell=True, stderr=subprocess.DEVNULL)
+    print("[OK] nftables configuré automatiquement.")
+
+# --- LOGGING ---
 def log_event(data):
     """Enregistre un événement en JSONL."""
     with open(LOG_FILE, "a") as f:
@@ -38,17 +53,20 @@ def log_event(data):
 def oscilloscope_ascii(intervals):
     """Affiche une visualisation simple des timings."""
     if OSCILLOSCOPE:
-        line = "".join("▮" if t > np.median(intervals) else "▯" for t in intervals)
+        mediane = np.median(intervals)
+        line = "".join("▮" if t > mediane else "▯" for t in intervals)
         print(f"[OSCILLO] {line}")
 
-def decode_intervales(intervalles):
-    """Convertit les timings en bits (1 ou 0 selon médiane)."""
+# --- DÉCODAGE ---
+def decode_intervalles(intervalles):
+    """Convertit les timings en bits, avec tolérance au jitter."""
     mediane = np.median(intervalles)
     bits = [1 if delta > mediane else 0 for delta in intervalles]
     if bits[:len(PREAMBULE)] == PREAMBULE:
         return bits[len(PREAMBULE):]
     return None
 
+# --- SPA ---
 def decrypter_spa(message_bytes):
     """Décrypte le SPA AES-GCM et vérifie le HMAC."""
     try:
@@ -64,20 +82,24 @@ def decrypter_spa(message_bytes):
         # Vérif HMAC
         hmac_attendu = hmac.new(CLE_HMAC, donnees[:-32], hashlib.sha256).digest()
         if hmac_attendu != bytes.fromhex(spa["hmac"]):
+            print("[!] HMAC invalide")
             return None
 
-        # Anti-rejeu : vérif timestamp
+        # Anti-rejeu
         maintenant = int(time.time())
         if abs(maintenant - spa["timestamp"]) > FENETRE_TEMPS:
+            print("[!] Timestamp expiré")
             return None
 
         return spa
-    except Exception:
+    except Exception as e:
+        print("[!] Erreur SPA :", e)
         return None
 
+# --- AUTORISATION IP ---
 def autoriser_ip(ip, duree=DUREE_PAR_DEFAUT):
-    """Ajoute l'IP dans nftables."""
-    subprocess.run(["nft", "add", "element", "inet", "filter", "allowed", f"{{ {ip} }}"])
+    """Ajoute l'IP dans le set nftables avec un timeout."""
+    subprocess.run(f"nft add element inet filter allowed {{ {ip} timeout {duree}s }}", shell=True)
     ips_autorisees[ip] = time.time() + duree
     print(f"[+] IP autorisée : {ip} ({duree}s)")
 
@@ -86,15 +108,13 @@ def nettoyer_ips_expirees():
     maintenant = time.time()
     for ip in list(ips_autorisees):
         if maintenant > ips_autorisees[ip]:
-            subprocess.run(["nft", "delete", "element", "inet", "filter", "allowed", f"{{ {ip} }}"])
+            subprocess.run(f"nft delete element inet filter allowed {{ {ip} }}", shell=True)
             del ips_autorisees[ip]
             print(f"[-] IP retirée : {ip}")
 
-# --- LANCEMENT ---
+# --- SERVEUR ---
 def serveur():
-    # Configuration nftables au démarrage
-    os.system("sudo nft add table inet filter 2>/dev/null")
-    os.system("sudo nft add set inet filter allowed { type ipv4_addr\; flags timeout\; } 2>/dev/null")
+    configurer_nftables()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
     sock.bind(("", PORT_LEURRE))
@@ -122,12 +142,11 @@ def serveur():
         derniers[ip_src] = maintenant
         arrivees[ip_src].append(delta)
 
-        # Oscilloscope
         oscilloscope_ascii(arrivees[ip_src])
 
-        # Si on a assez de bits
+        # Si on a reçu assez de bits
         if len(arrivees[ip_src]) >= len(PREAMBULE) + 64:
-            bits = decode_intervales(arrivees[ip_src])
+            bits = decode_intervalles(arrivees[ip_src])
             arrivees[ip_src] = []
             if bits:
                 octets = bytes([int("".join(map(str, bits[i:i+8])), 2)
