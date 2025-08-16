@@ -9,7 +9,6 @@ from datetime import datetime
 from statistics import median
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # type: ignore
 
-# ---------- stdout non bufferisé
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
@@ -19,7 +18,6 @@ def LOG(tag, **kw):
     s = " ".join(f"{k}={v}" for k,v in kw.items())
     print(f"[{tag}]{(' '+s) if s else ''}", flush=True)
 
-# ---------- bootstrap deps
 def _pip(*pkgs):
     try: subprocess.run([sys.executable, "-m", "pip", "install", "-q", *pkgs], check=True); return True
     except Exception: return False
@@ -44,7 +42,6 @@ def ensure_pydeps():
     except Exception:
         LOG("BOOT", step="install_cryptography")
         _pip("cryptography") or _apt("python3-cryptography") or _dnf("python3-cryptography") or _pacman("python-cryptography")
-    # Scapy (fallback sniff)
     try:
         import scapy.all  # noqa
     except Exception:
@@ -63,7 +60,6 @@ def must_root():
     if os.geteuid() != 0:
         print("[ERREUR] Lancer avec sudo.", file=sys.stderr); sys.exit(1)
 
-# ---------- constantes
 LURE_PORT          = 443
 SSH_PORT           = 2222
 LISTEN_ADDR_SSHD   = "0.0.0.0"
@@ -90,7 +86,6 @@ def jlog(event, **fields):
     except Exception:
         pass
 
-# ---------- secrets & clés
 def b64_read(raw: str) -> bytes:
     tok = raw.strip().split()[0] if raw.strip() else ""
     try: return base64.b64decode(tok, validate=True)
@@ -127,7 +122,6 @@ def derive_keys(master: bytes):
     mac = hashlib.sha256(master + b"|HMAC").digest()
     return aes, mac
 
-# ---------- firewall externe auto (si actif)
 def firewall_open_if_needed():
     if shutil.which("ufw"):
         try:
@@ -147,7 +141,6 @@ def firewall_open_if_needed():
                 LOG("FIREWALLD", opened=f"{LURE_PORT}, {SSH_PORT}")
         except Exception: pass
 
-# ---------- nftables
 def nft_delete_table():
     subprocess.run(["bash","-lc", f"nft list table inet {NFT_TABLE} >/dev/null 2>&1 && nft delete table inet {NFT_TABLE} || true"], check=False)
 
@@ -178,7 +171,6 @@ def nft_gc():
             ips_autorisees.pop(ip, None)
             LOG("CLOSE", ip=ip); jlog("close", ip=ip)
 
-# ---------- sshd éphémère
 def ensure_host_keys():
     subprocess.run(["bash","-lc","test -f /etc/ssh/ssh_host_ed25519_key || ssh-keygen -A"], check=False)
 
@@ -198,9 +190,7 @@ def stop_sshd():
         except: _sshd.kill()
         LOG("SSHD", status="stopped")
 
-# ---------- crypto + décodage
-def _classify(deltas):
-    m = median(deltas); return [1 if d>m else 0 for d in deltas]
+def _classify(deltas): m = median(deltas); return [1 if d>m else 0 for d in deltas]
 def _find(seq, pat):
     n, m = len(seq), len(pat)
     for i in range(0, n-m+1):
@@ -236,9 +226,8 @@ def try_decode_for_ip(src_ip, deltas, aes_key, hmac_key):
     rough = _classify(deltas)
     idx = _find(rough, PREAMBULE)
     if idx < 0: return False
-    after = rough[idx+len(PREAMULE):] if 'PREAMULE' in globals() else rough[idx+len(PREAMBULE):]  # safety
-    # correction : utiliser PREAMBULE
-    after = rough[idx+len(PREAMBULE):]
+    after = rough[idx+len(PREAMBLE):] if False else rough[idx+len(PREAMULE):]  # placeholder no-op
+    after = rough[idx+len(PREAMBULE):]  # correct
     if len(after) < 16: return False
     L = int("".join(map(str, after[:16])), 2)
     total_bits = len(PREAMBULE) + 16 + 8*L
@@ -253,7 +242,6 @@ def try_decode_for_ip(src_ip, deltas, aes_key, hmac_key):
     nft_add_allowed(src_ip, ttl)
     return True
 
-# ---------- écoute réseau
 def loop_raw(aes_key, hmac_key):
     s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
     s.settimeout(1.0)
@@ -308,7 +296,6 @@ def loop_scapy(aes_key, hmac_key):
             LOG("SCAPY_CB_ERROR", err=str(e))
     sniff(filter=f"tcp and dst port {LURE_PORT}", prn=_prn, store=False, stop_filter=lambda p: _stop)
 
-# ---------- main
 def cleanup():
     nft_delete_table()
     stop_sshd()
