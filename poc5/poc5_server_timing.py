@@ -277,14 +277,14 @@ def try_decode_for_ip(src_ip, deltas, aes_key, hmac_key):
 # ------- capture (Scapy par défaut — fonctionne sur loopback) -------
 def loop_scapy(aes_key, hmac_key):
     from scapy.all import sniff, TCP, IP  # type: ignore
-    LOG("LISTEN", mode="scapy", bpf=f"tcp and dst port {LURE_PORT}")
+    iface = "any"  # <— la clé : voir aussi "lo" si tu veux strictement le loopback
+    LOG("LISTEN", mode="scapy", iface=iface, bpf=f"tcp and dst port {LURE_PORT}")
     def _prn(p):
         try:
             if not p.haslayer(TCP) or not p.haslayer(IP): return
             if p[TCP].dport != LURE_PORT: return
-            # SYN sans ACK
             f = int(p[TCP].flags)
-            if (f & 0x02) == 0 or (f & 0x10) != 0: return
+            if (f & 0x02) == 0 or (f & 0x10) != 0: return  # SYN sans ACK
             src_ip = p[IP].src
             now = time.monotonic()
             last = derniers.get(src_ip); derniers[src_ip] = now
@@ -295,15 +295,20 @@ def loop_scapy(aes_key, hmac_key):
             delta = now - last
             lst = arrivees.setdefault(src_ip, [])
             lst.append(delta)
-            if len(lst) % 50 == 0:  # petit heartbeat
+            if len(lst) % 50 == 0:
                 LOG("PKT", ip=src_ip, count=len(lst))
-            try: try_decode_for_ip(src_ip, lst, aes_key, hmac_key)
-            except Exception as e: LOG("DECODE_ERROR", err=str(e))
-            if len(lst) > 4096: arrivees[src_ip] = lst[-1024:]
+            try:
+                try_decode_for_ip(src_ip, lst, aes_key, hmac_key)
+            except Exception as e:
+                LOG("DECODE_ERROR", err=str(e))
+            if len(lst) > 4096:
+                arrivees[src_ip] = lst[-1024:]
             nft_gc()
         except Exception as e:
             LOG("SCAPY_CB_ERROR", err=str(e))
-    sniff(filter=f"tcp and dst port {LURE_PORT}", prn=_prn, store=False, stop_filter=lambda p: _stop)
+    sniff(iface=iface, filter=f"tcp and dst port {LURE_PORT}",
+          prn=_prn, store=False, stop_filter=lambda p: _stop)
+
 
 def cleanup():
     subprocess.run(["bash","-lc", f"nft list table inet {NFT_TABLE} >/dev/null 2>&1 && nft delete table inet {NFT_TABLE} || true"], check=False)
