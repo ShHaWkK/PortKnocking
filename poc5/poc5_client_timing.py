@@ -2,19 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 POC5 - Client (timing SYN -> SPA AES-GCM)
-- Récupère automatiquement le secret via SSH si absent (~/.config/portknock/secret)
-Usage simple : sudo python3 poc5_client_timing.py --host <IP/DNS> --auto-ssh
+Usage minimal :  sudo python3 poc5_client_timing.py 127.0.0.1
+- Si cible = 127.0.0.1/localhost : lit /etc/portknock/secret local (pas d’SSH).
+- Sinon : récupère le secret via SSH avec l’utilisateur SUDO_USER (si présent), puis envoie la trame.
+- Lance SSH auto sur :2222 (désactive avec --no-ssh).
 """
 import os, sys, time, json, hmac, hashlib, base64, random, socket, subprocess, shutil, argparse, getpass, traceback
 from typing import List
-from scapy.all import IP, TCP, send  # type: ignore
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # type: ignore
 
+# ---------- logs compacts ----------
 def LOG(tag, **kw):
     s = " ".join(f"{k}={v}" for k,v in kw.items())
     print(f"[{tag}]{(' '+s) if s else ''}", flush=True)
 
-# ---- deps (au cas où)
+# ---------- deps ----------
 def _pip(*pkgs):
     try: subprocess.run([sys.executable, "-m", "pip", "install", "-q", *pkgs], check=True); return True
     except Exception: return False
@@ -39,33 +40,71 @@ def must_root():
     if os.geteuid() != 0:
         print("[ERREUR] Lance ce client avec sudo.", file=sys.stderr); sys.exit(1)
 
-# ---- config
+# ---------- constantes ----------
 LURE_PORT      = 443
 SSH_PORT       = 2222
 PREAMBULE      = [1,0,1,0,1,0,1,0]
 SECRET_FILE    = os.path.expanduser("~/.config/portknock/secret")
+LOCAL_SECRET   = "/etc/portknock/secret"  # lu quand cible == localhost
 
-# ---- secret auto
+# ---------- util ----------
 def b64_read(raw: str) -> bytes:
     tok = raw.strip().split()[0] if raw.strip() else ""
     try: return base64.b64decode(tok, validate=True)
     except Exception: return base64.b64decode(tok)
 
-def ensure_local_secret(host: str, user: str, ssh_port: int) -> bytes:
-    os.makedirs(os.path.dirname(SECRET_FILE), exist_ok=True)
-    if os.path.exists(SECRET_FILE):
-        return b64_read(open(SECRET_FILE).read())
-    LOG("SECRET", action="fetch_from_server")
-    # demande ton mot de passe si nécessaire
-    r = subprocess.run(["ssh","-p",str(ssh_port), f"{user}@{host}", "sudo cat /etc/portknock/secret"],
+def read_file_if_exists(path: str) -> bytes | None:
+    try:
+        if os.path.exists(path):
+            return b64_read(open(path).read())
+    except Exception:
+        pass
+    return None
+
+def secret_from_known_locations() -> bytes | None:
+    # cherche d’abord dans $HOME (utile si tu l’as déjà)
+    s = read_file_if_exists(SECRET_FILE)
+    if s: return s
+    # si lancé avec sudo, regarde aussi dans le HOME du SUDO_USER
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        home = os.path.expanduser(f"~{sudo_user}")
+        alt = os.path.join(home, ".config/portknock/secret")
+        s = read_file_if_exists(alt)
+        if s: return s
+    return None
+
+def ensure_secret_for(server: str) -> bytes:
+    # 1) si secret déjà présent (dans $HOME ou $SUDO_USER), utilise-le
+    s = secret_from_known_locations()
+    if s: 
+        LOG("SECRET", source="~/.config/portknock/secret (cached)"); 
+        return s
+
+    # 2) si on vise localhost, lis directement /etc/portknock/secret (PAS d’SSH)
+    if server in ("127.0.0.1", "localhost"):
+        if not os.path.exists(LOCAL_SECRET):
+            print("[ERREUR] /etc/portknock/secret introuvable en local (lance le serveur ?)", file=sys.stderr)
+            sys.exit(1)
+        raw = open(LOCAL_SECRET).read()
+        os.makedirs(os.path.dirname(SECRET_FILE), exist_ok=True)
+        with open(SECRET_FILE, "w") as f: f.write(raw.strip().split()[0]+"\n")
+        os.chmod(SECRET_FILE, 0o600)
+        LOG("SECRET", source=LOCAL_SECRET, copied_to=SECRET_FILE)
+        return b64_read(raw)
+
+    # 3) sinon, récupère via SSH avec l’utilisateur non-root (SUDO_USER si dispo)
+    user = os.environ.get("SUDO_USER") or getpass.getuser()
+    LOG("SECRET", action="fetch_via_ssh", user=user, host=server)
+    r = subprocess.run(["ssh", f"{user}@{server}", "sudo cat /etc/portknock/secret"],
                        text=True, capture_output=True)
     if r.returncode != 0 or not r.stdout.strip():
         print("[ERREUR] Impossible de récupérer le secret via ssh.", file=sys.stderr); sys.exit(1)
+    os.makedirs(os.path.dirname(SECRET_FILE), exist_ok=True)
     with open(SECRET_FILE,"w") as f: f.write(r.stdout.strip().split()[0]+"\n")
     os.chmod(SECRET_FILE, 0o600)
-    return b64_read(open(SECRET_FILE).read())
+    return b64_read(r.stdout)
 
-# ---- crypto + trame
 def derive_keys(master: bytes):
     return hashlib.sha256(master + b"|AES").digest(), hashlib.sha256(master + b"|HMAC").digest()
 
@@ -75,6 +114,7 @@ def canonical_hmac(key: bytes, duration: int, ts: int) -> str:
     return hmac.new(key, canon, hashlib.sha256).hexdigest()
 
 def build_spa_bytes(aes_key: bytes, hmac_key: bytes, duration: int) -> bytes:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     ts = int(time.time())
     spa_plain = {"timestamp": ts, "duration": int(duration)}
     spa_plain["hmac"] = canonical_hmac(hmac_key, spa_plain["duration"], spa_plain["timestamp"])
@@ -94,6 +134,7 @@ def build_frame_bits(msg_bytes: bytes) -> List[int]:
     return PREAMBULE + len_bits + bytes_to_bits(msg_bytes)
 
 def send_timing(bits: List[int], dst_ip: str, d0: float, d1: float, iface: str = None):
+    from scapy.all import IP, TCP, send  # import tardif après ensure_pydeps()
     sport = random.randint(1024, 65000)
     seq0  = random.randint(0, 2**32-1)
     for i, b in enumerate(bits):
@@ -106,23 +147,21 @@ def main():
     must_root()
     ensure_pydeps()
 
-    ap = argparse.ArgumentParser(description="POC5 client")
-    ap.add_argument("--host", required=True, help="IP/DNS du serveur")
-    ap.add_argument("--user", default=getpass.getuser(), help="Utilisateur SSH pour récupérer le secret")
-    ap.add_argument("--ssh-port", type=int, default=22, help="Port SSH vers le serveur (défaut 22)")
+    ap = argparse.ArgumentParser(description="POC5 client (usage: sudo python3 poc5_client_timing.py 127.0.0.1)")
+    ap.add_argument("server", help="IP/DNS du serveur (ex: 127.0.0.1)")
     ap.add_argument("--duration", type=int, default=60, help="TTL d'ouverture (s)")
     ap.add_argument("--d0", type=float, default=0.08, help="intervalle bit 0 (s)")
     ap.add_argument("--d1", type=float, default=0.24, help="intervalle bit 1 (s)")
     ap.add_argument("--iface", default=None)
-    ap.add_argument("--auto-ssh", action="store_true")
+    ap.add_argument("--no-ssh", action="store_true", help="ne pas lancer SSH automatiquement")
     args = ap.parse_args()
 
     try:
-        dst_ip = socket.gethostbyname(args.host)
+        dst_ip = socket.gethostbyname(args.server)
     except Exception:
         print("[ERREUR] Résolution serveur impossible.", file=sys.stderr); sys.exit(1)
 
-    master  = ensure_local_secret(args.host, args.user, args.ssh_port)
+    master  = ensure_secret_for(args.server)
     aes_key, hmac_key = derive_keys(master)
     spa   = build_spa_bytes(aes_key, hmac_key, args.duration)
     frame = build_frame_bits(spa)
@@ -130,12 +169,11 @@ def main():
     LOG("INFO", target=dst_ip, bits=len(frame), d0=args.d0, d1=args.d1)
     send_timing(frame, dst_ip, args.d0, args.d1, iface=args.iface)
 
-    if args.auto-ssh:
+    if not args.no_ssh:
         time.sleep(1.5)
-        os.execvp("ssh", ["ssh","-p",str(SSH_PORT),"-o","StrictHostKeyChecking=accept-new",f"{getpass.getuser()}@{args.host}"])
+        os.execvp("ssh", ["ssh","-p","2222","-o","StrictHostKeyChecking=accept-new",f"{getpass.getuser()}@{args.server}"])
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
+    try: main()
+    except Exception: 
         LOG("FATAL", trace=traceback.format_exc()); sys.exit(1)
