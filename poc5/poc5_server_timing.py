@@ -2,60 +2,52 @@
 # -*- coding: utf-8 -*-
 """
 POC5 - Serveur (timing SYN 443 -> SPA AES-GCM) + nftables + sshd éphémère
-- Affiche des logs immédiats (flush), trap toutes les erreurs
-- Raw socket par défaut, *fallback* scapy si nécessaire
-- Ouvre UFW/Firewalld uniquement s'ils sont actifs
 Commande : sudo python3 poc5_server_timing.py
 """
 import os, sys, time, json, hmac, hashlib, base64, shutil, socket, signal, subprocess, getpass, pwd, traceback
 from datetime import datetime
 from statistics import median
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # type: ignore
 
-# ------------ sortie non bufferisée
+# ---------- stdout non bufferisé
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
     pass
 
-def LOG(msg, **kw):
+def LOG(tag, **kw):
     s = " ".join(f"{k}={v}" for k,v in kw.items())
-    print(f"[{msg}]{(' '+s) if s else ''}", flush=True)
+    print(f"[{tag}]{(' '+s) if s else ''}", flush=True)
 
-# ------------ bootstrap deps
-def _pip(*pkgs): 
+# ---------- bootstrap deps
+def _pip(*pkgs):
     try: subprocess.run([sys.executable, "-m", "pip", "install", "-q", *pkgs], check=True); return True
     except Exception: return False
-
 def _apt(*pkgs):
     if not shutil.which("apt"): return False
     try:
         subprocess.run(["sudo","apt","update"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["sudo","apt","install","-y",*pkgs], check=False); return True
     except Exception: return False
-
 def _dnf(*pkgs):
     if not shutil.which("dnf"): return False
     try: subprocess.run(["sudo","dnf","install","-y",*pkgs], check=False); return True
     except Exception: return False
-
 def _pacman(*pkgs):
     if not shutil.which("pacman"): return False
     try: subprocess.run(["sudo","pacman","-Sy","--noconfirm",*pkgs], check=False); return True
     except Exception: return False
 
 def ensure_pydeps():
-    need_scapy = False
     try:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa
     except Exception:
         LOG("BOOT", step="install_cryptography")
         _pip("cryptography") or _apt("python3-cryptography") or _dnf("python3-cryptography") or _pacman("python-cryptography")
-    # scapy est utile pour le fallback
+    # Scapy (fallback sniff)
     try:
         import scapy.all  # noqa
     except Exception:
-        need_scapy = True
-    if need_scapy:
         LOG("BOOT", step="install_scapy")
         _pip("scapy") or _apt("python3-scapy") or _dnf("python3-scapy") or _pacman("python-scapy")
 
@@ -71,7 +63,7 @@ def must_root():
     if os.geteuid() != 0:
         print("[ERREUR] Lancer avec sudo.", file=sys.stderr); sys.exit(1)
 
-# ------------ constantes
+# ---------- constantes
 LURE_PORT          = 443
 SSH_PORT           = 2222
 LISTEN_ADDR_SSHD   = "0.0.0.0"
@@ -79,7 +71,7 @@ PREAMBULE          = [1,0,1,0,1,0,1,0]
 MIN_TOTAL_BITS     = 8 + 16 + 8
 ANTI_REPLAY_S      = 90
 OPEN_TTL_S_DEFAULT = 60
-LOG_FILE           = "/var/log/portknock/poc5_server.jsonl"
+LOG_PATH           = "/var/log/portknock/poc5_server.jsonl"
 NFT_TABLE          = "knock5"
 NFT_CHAIN_INPUT    = "inbound"
 NFT_SET_ALLOWED    = "allowed"
@@ -93,12 +85,12 @@ _sshd = None
 def jlog(event, **fields):
     row = {"ts": datetime.utcnow().isoformat()+"Z", "event": event}; row.update(fields)
     try:
-        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-        with open(LOG_FILE,"a") as f: f.write(json.dumps(row, ensure_ascii=False)+"\n")
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        with open(LOG_PATH,"a") as f: f.write(json.dumps(row, ensure_ascii=False)+"\n")
     except Exception:
         pass
 
-# ------------ secrets & clés
+# ---------- secrets & clés
 def b64_read(raw: str) -> bytes:
     tok = raw.strip().split()[0] if raw.strip() else ""
     try: return base64.b64decode(tok, validate=True)
@@ -135,9 +127,8 @@ def derive_keys(master: bytes):
     mac = hashlib.sha256(master + b"|HMAC").digest()
     return aes, mac
 
-# ------------ firewall externe auto (si actif)
+# ---------- firewall externe auto (si actif)
 def firewall_open_if_needed():
-    # UFW
     if shutil.which("ufw"):
         try:
             st = subprocess.run(["bash","-lc","ufw status | grep -i active || true"], text=True, capture_output=True).stdout
@@ -146,7 +137,6 @@ def firewall_open_if_needed():
                 subprocess.run(["bash","-lc", f"ufw allow {SSH_PORT}/tcp || true"], check=False)
                 LOG("UFW", opened=f"{LURE_PORT}, {SSH_PORT}")
         except Exception: pass
-    # firewalld
     if shutil.which("firewall-cmd"):
         try:
             st = subprocess.run(["firewall-cmd","--state"], text=True, capture_output=True).stdout.strip()
@@ -157,7 +147,7 @@ def firewall_open_if_needed():
                 LOG("FIREWALLD", opened=f"{LURE_PORT}, {SSH_PORT}")
         except Exception: pass
 
-# ------------ nftables
+# ---------- nftables
 def nft_delete_table():
     subprocess.run(["bash","-lc", f"nft list table inet {NFT_TABLE} >/dev/null 2>&1 && nft delete table inet {NFT_TABLE} || true"], check=False)
 
@@ -188,7 +178,7 @@ def nft_gc():
             ips_autorisees.pop(ip, None)
             LOG("CLOSE", ip=ip); jlog("close", ip=ip)
 
-# ------------ sshd éphémère
+# ---------- sshd éphémère
 def ensure_host_keys():
     subprocess.run(["bash","-lc","test -f /etc/ssh/ssh_host_ed25519_key || ssh-keygen -A"], check=False)
 
@@ -208,18 +198,14 @@ def stop_sshd():
         except: _sshd.kill()
         LOG("SSHD", status="stopped")
 
-# ------------ crypto + décodage
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa
-
+# ---------- crypto + décodage
 def _classify(deltas):
     m = median(deltas); return [1 if d>m else 0 for d in deltas]
-
 def _find(seq, pat):
     n, m = len(seq), len(pat)
     for i in range(0, n-m+1):
         if seq[i:i+m] == pat: return i
     return -1
-
 def _bits_to_bytes(bits):
     if len(bits)%8: return b""
     out = bytearray()
@@ -250,13 +236,15 @@ def try_decode_for_ip(src_ip, deltas, aes_key, hmac_key):
     rough = _classify(deltas)
     idx = _find(rough, PREAMBULE)
     if idx < 0: return False
-    after = rough[idx+len(PREAMBLE):]
+    after = rough[idx+len(PREAMULE):] if 'PREAMULE' in globals() else rough[idx+len(PREAMBULE):]  # safety
+    # correction : utiliser PREAMBULE
+    after = rough[idx+len(PREAMBULE):]
     if len(after) < 16: return False
     L = int("".join(map(str, after[:16])), 2)
-    total_bits = len(PREAMBLE) + 16 + 8*L
+    total_bits = len(PREAMBULE) + 16 + 8*L
     if len(deltas) < idx + total_bits: return False
     seg_bits = _classify(deltas[idx: idx+total_bits])
-    msg_bits = seg_bits[len(PREAMBLE)+16:]
+    msg_bits = seg_bits[len(PREAMBULE)+16:]
     data = _bits_to_bytes(msg_bits)
     spa = spa_decrypt_and_verify(data, aes_key, hmac_key)
     arrivees[src_ip].clear()
@@ -265,7 +253,7 @@ def try_decode_for_ip(src_ip, deltas, aes_key, hmac_key):
     nft_add_allowed(src_ip, ttl)
     return True
 
-# ------------ écoute réseau
+# ---------- écoute réseau
 def loop_raw(aes_key, hmac_key):
     s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
     s.settimeout(1.0)
@@ -320,14 +308,14 @@ def loop_scapy(aes_key, hmac_key):
             LOG("SCAPY_CB_ERROR", err=str(e))
     sniff(filter=f"tcp and dst port {LURE_PORT}", prn=_prn, store=False, stop_filter=lambda p: _stop)
 
-# ------------ main
+# ---------- main
 def cleanup():
     nft_delete_table()
     stop_sshd()
     LOG("CLEANUP"); jlog("server_stop")
 
 def main():
-    LOG("BOOT", msg="starting")
+    LOG("BOOT", text="starting")
     must_root()
     ensure_pydeps()
     ensure_sysbins()
@@ -343,7 +331,7 @@ def main():
     ensure_host_keys()
     start_sshd()
 
-    LOG("READY", server="up"); jlog("server_start", lure=LURE_PORT, ssh=SSH_PORT)
+    LOG("READY", server="up", log=LOG_PATH); jlog("server_start", lure=LURE_PORT, ssh=SSH_PORT)
 
     def _sig(_s, _f):
         global _stop; _stop = True
