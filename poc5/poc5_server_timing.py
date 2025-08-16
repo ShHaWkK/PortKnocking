@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-POC5 - Serveur (timing SYN 443 -> SPA AES-GCM) + nftables + sshd éphémère
-Commande : sudo python3 poc5_server_timing.py
-"""
-import os, sys, time, json, hmac, hashlib, base64, shutil, socket, signal, subprocess, getpass, pwd, traceback
+# POC5 - Serveur (timing SYN 443 -> SPA binaire AES-GCM) + nftables + sshd éphémère
+import os, sys, time, json, hmac, hashlib, base64, shutil, socket, signal, subprocess, getpass, pwd, traceback, struct
 from datetime import datetime
 from statistics import median
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # type: ignore
@@ -13,7 +10,6 @@ try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
     pass
-
 def LOG(tag, **kw):
     s = " ".join(f"{k}={v}" for k,v in kw.items())
     print(f"[{tag}]{(' '+s) if s else ''}", flush=True)
@@ -43,7 +39,7 @@ def ensure_pydeps():
         LOG("BOOT", step="install_cryptography")
         _pip("cryptography") or _apt("python3-cryptography") or _dnf("python3-cryptography") or _pacman("python-cryptography")
     try:
-        import scapy.all  # noqa
+        import scapy.all  # noqa (fallback sniff)
     except Exception:
         LOG("BOOT", step="install_scapy")
         _pip("scapy") or _apt("python3-scapy") or _dnf("python3-scapy") or _pacman("python-scapy")
@@ -60,19 +56,17 @@ def must_root():
     if os.geteuid() != 0:
         print("[ERREUR] Lancer avec sudo.", file=sys.stderr); sys.exit(1)
 
-LURE_PORT          = 443
-SSH_PORT           = 2222
-LISTEN_ADDR_SSHD   = "0.0.0.0"
-PREAMBULE          = [1,0,1,0,1,0,1,0]
-MIN_TOTAL_BITS     = 8 + 16 + 8
-ANTI_REPLAY_S      = 90
+# ---- constantes
+LURE_PORT, SSH_PORT = 443, 2222
+LISTEN_ADDR_SSHD = "0.0.0.0"
+PREAMBULE = [1,0,1,0,1,0,1,0]
+MIN_TOTAL_BITS = 8 + 16 + 8
+ANTI_REPLAY_S = 90
 OPEN_TTL_S_DEFAULT = 60
-LOG_PATH           = "/var/log/portknock/poc5_server.jsonl"
-NFT_TABLE          = "knock5"
-NFT_CHAIN_INPUT    = "inbound"
-NFT_SET_ALLOWED    = "allowed"
+LOG_PATH = "/var/log/portknock/poc5_server.jsonl"
+NFT_TABLE, NFT_CHAIN_INPUT, NFT_SET_ALLOWED = "knock5", "inbound", "allowed"
 MASTER_SECRET_PATH = "/etc/portknock/secret"
-USER_COPY_FMT      = "{home}/.config/portknock/{name}"
+USER_COPY_FMT = "{home}/.config/portknock/{name}"
 
 arrivees, derniers, ips_autorisees = {}, {}, {}
 _stop = False
@@ -83,8 +77,7 @@ def jlog(event, **fields):
     try:
         os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
         with open(LOG_PATH,"a") as f: f.write(json.dumps(row, ensure_ascii=False)+"\n")
-    except Exception:
-        pass
+    except Exception: pass
 
 def b64_read(raw: str) -> bytes:
     tok = raw.strip().split()[0] if raw.strip() else ""
@@ -203,21 +196,27 @@ def _bits_to_bytes(bits):
         out.append(int("".join(map(str,bits[i:i+8])),2))
     return bytes(out)
 
-def spa_decrypt_and_verify(msg_bytes: bytes, aes_key: bytes, hmac_key: bytes):
+# --------- NOUVEAU: SPA binaire (version 1)
+def spa_decrypt_and_verify_binary(wire: bytes, aes_key: bytes, hmac_key: bytes):
     try:
-        obj = json.loads(msg_bytes.decode())
-        ciphertext = bytes.fromhex(obj["ciphertext"])
-        nonce = bytes.fromhex(obj["nonce"])
-        tag = bytes.fromhex(obj["tag"])
-        pt = AESGCM(aes_key).decrypt(nonce, ciphertext + tag, None)
-        spa = json.loads(pt.decode())
-        payload = {"duration": int(spa["duration"]), "timestamp": int(spa["timestamp"])}
-        canon = json.dumps(payload, separators=(",",":"), sort_keys=True).encode()
-        expect = hmac.new(hmac_key, canon, hashlib.sha256).hexdigest()
-        if expect != spa.get("hmac",""): LOG("HMAC_BAD"); return None
-        if abs(int(time.time()) - int(spa["timestamp"])) > ANTI_REPLAY_S:
+        if len(wire) < 1+12+2+16:  # v(1)+nonce(12)+len(2)+ctag(>=16)
+            LOG("SPA_WIRE_SHORT", n=len(wire)); return None
+        if wire[0] != 0x01:
+            LOG("SPA_BAD_VER", v=wire[0]); return None
+        nonce = wire[1:13]
+        clen  = struct.unpack("!H", wire[13:15])[0]
+        ctag  = wire[15:15+clen]
+        pt    = AESGCM(aes_key).decrypt(nonce, ctag, None)  # => t(4) | d(2) | H(16)
+        if len(pt) != 22:
+            LOG("SPA_PT_LEN", n=len(pt)); return None
+        t, d = struct.unpack("!IH", pt[:6])
+        sig  = pt[6:22]
+        exp  = hmac.new(hmac_key, pt[:6], hashlib.sha256).digest()[:16]
+        if sig != exp:
+            LOG("HMAC_BAD"); return None
+        if abs(int(time.time()) - int(t)) > ANTI_REPLAY_S:
             LOG("SPA_STALE"); return None
-        return spa
+        return {"timestamp": int(t), "duration": int(d)}
     except Exception as e:
         LOG("SPA_ERROR", err=str(e)); return None
 
@@ -226,8 +225,7 @@ def try_decode_for_ip(src_ip, deltas, aes_key, hmac_key):
     rough = _classify(deltas)
     idx = _find(rough, PREAMBULE)
     if idx < 0: return False
-    after = rough[idx+len(PREAMBLE):] if False else rough[idx+len(PREAMULE):]  # placeholder no-op
-    after = rough[idx+len(PREAMBULE):]  # correct
+    after = rough[idx+len(PREAMULE):] if False else rough[idx+len(PREAMBULE):]
     if len(after) < 16: return False
     L = int("".join(map(str, after[:16])), 2)
     total_bits = len(PREAMBULE) + 16 + 8*L
@@ -235,7 +233,7 @@ def try_decode_for_ip(src_ip, deltas, aes_key, hmac_key):
     seg_bits = _classify(deltas[idx: idx+total_bits])
     msg_bits = seg_bits[len(PREAMBULE)+16:]
     data = _bits_to_bytes(msg_bits)
-    spa = spa_decrypt_and_verify(data, aes_key, hmac_key)
+    spa = spa_decrypt_and_verify_binary(data, aes_key, hmac_key)
     arrivees[src_ip].clear()
     if not spa: return False
     ttl = int(spa.get("duration", OPEN_TTL_S_DEFAULT)) or OPEN_TTL_S_DEFAULT
@@ -243,8 +241,7 @@ def try_decode_for_ip(src_ip, deltas, aes_key, hmac_key):
     return True
 
 def loop_raw(aes_key, hmac_key):
-    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
-    s.settimeout(1.0)
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP); s.settimeout(1.0)
     LOG("LISTEN", mode="raw", dport=LURE_PORT)
     while not _stop:
         try:
@@ -296,48 +293,31 @@ def loop_scapy(aes_key, hmac_key):
             LOG("SCAPY_CB_ERROR", err=str(e))
     sniff(filter=f"tcp and dst port {LURE_PORT}", prn=_prn, store=False, stop_filter=lambda p: _stop)
 
+def nft_delete_table(): subprocess.run(["bash","-lc", f"nft list table inet {NFT_TABLE} >/dev/null 2>&1 && nft delete table inet {NFT_TABLE} || true"], check=False)
 def cleanup():
-    nft_delete_table()
-    stop_sshd()
-    LOG("CLEANUP"); jlog("server_stop")
+    nft_delete_table(); stop_sshd(); LOG("CLEANUP"); jlog("server_stop")
 
 def main():
-    LOG("BOOT", text="starting")
-    must_root()
-    ensure_pydeps()
-    ensure_sysbins()
+    LOG("BOOT", text="starting"); must_root(); ensure_pydeps(); ensure_sysbins()
     firewall_open_if_needed()
-
     master = load_or_create_master_secret()
     aes_key = hashlib.sha256(master + b"|AES").digest()
     hmac_key = hashlib.sha256(master + b"|HMAC").digest()
     copy_secret_for_user("secret", base64.b64encode(master).decode())
-
     ttl = OPEN_TTL_S_DEFAULT if OPEN_TTL_S_DEFAULT>0 else 24*3600
-    nft_install_base(ttl)
-    ensure_host_keys()
-    start_sshd()
-
+    nft_install_base(ttl); ensure_host_keys(); start_sshd()
     LOG("READY", server="up", log=LOG_PATH); jlog("server_start", lure=LURE_PORT, ssh=SSH_PORT)
-
-    def _sig(_s, _f):
+    def _sig(_s,_f):
         global _stop; _stop = True
-    signal.signal(signal.SIGINT, _sig)
-    signal.signal(signal.SIGTERM, _sig)
-
+    signal.signal(signal.SIGINT, _sig); signal.signal(signal.SIGTERM, _sig)
     try:
-        try:
-            loop_raw(aes_key, hmac_key)
+        try: loop_raw(aes_key, hmac_key)
         except Exception as e:
-            LOG("RAW_FAIL", err=str(e), hint="fallback_scapy")
-            loop_scapy(aes_key, hmac_key)
+            LOG("RAW_FAIL", err=str(e), hint="fallback_scapy"); loop_scapy(aes_key, hmac_key)
     finally:
         cleanup()
 
 if __name__ == "__main__":
-    try:
-        main()
+    try: main()
     except Exception:
-        LOG("FATAL", trace=traceback.format_exc())
-        cleanup()
-        sys.exit(1)
+        LOG("FATAL", trace=traceback.format_exc()); cleanup(); sys.exit(1)
