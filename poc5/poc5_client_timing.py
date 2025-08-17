@@ -119,4 +119,19 @@ def main():
         bits=build_frame(wire)
         LOG("INFO", channel="timing", target=dst_ip, bytes=len(wire), bits=len(bits), d0=d0, d1=d1, profile=prof, iface=(iface or "auto"))
         if args.dry_run: LOG("DRY", bits="".join(str(b) for b in bits[:32])); return
-        send_timing(bits, dst_ip, d0, d1, iface
+        send_timing(bits, dst_ip, d0, d1, iface=iface)
+    else:
+        LOG("INFO", channel="win", target=dst_ip, bytes=len(wire), iface=(iface or "auto"))
+        if args.dry_run:
+            nibb = bytes_to_nibbles(wire)[:8]; LOG("DRY", first_nibbles="".join(hex(x)[2:] for x in nibb)); return
+        send_win(wire, dst_ip, iface=iface, delay=0.003 if is_loopback else 0.005)
+
+    if not args.no_ssh:
+        ssh_user=os.environ.get("SUDO_USER") or getpass.getuser()
+        time.sleep(0.8)
+        os.execvp("ssh", ["ssh","-p",str(SSH_PORT),"-o","StrictHostKeyChecking=accept-new", f"{ssh_user}@{args.server}"])
+
+if __name__=="__main__":
+    try: main()
+    except Exception:
+        LOG("FATAL", trace=traceback.format_exc()); sys.exit(1)
