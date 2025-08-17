@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-POC5 — Serveur timing+SPA
-- Sniff Scapy multi-interfaces (loopback compris)
-- Seuil issu du préambule (robuste au jitter) => plus de SPA_BAD_VER=170
-- Compatible 2 formats client : 416 bits (fast) et 448 bits (legacy)
-- nftables + sshd : tout auto
-Usage: sudo python3 poc5_server_timing.py [--iface lo,eth0]
+POC5 — Serveur timing+SPA (robuste)
+- Sniff Scapy (loopback inclus) ; deltas basés sur pkt.time (pcap)
+- Détection par corrélation du préambule (tolérant au jitter)
+- Seuil dérivé du préambule ; validation octet 0x01 ; parse FAST(416) puis LEGACY(448)
+- nftables + sshd:2222 auto ; secret auto ; UFW/firewalld si actifs
+Usage:
+  sudo python3 poc5_server_timing.py --iface lo
 """
 import os, sys, time, json, hmac, hashlib, base64, shutil, signal, subprocess, getpass, pwd, struct, threading, traceback
 from datetime import datetime
@@ -14,37 +15,32 @@ from statistics import median
 
 try: sys.stdout.reconfigure(line_buffering=True)
 except Exception: pass
+def LOG(tag, **kw): print(f"[{tag}]"+(" "+" ".join(f"{k}={v}" for k,v in kw.items()) if kw else ""), flush=True)
 
-def LOG(tag, **kw):
-    s = " ".join(f"{k}={v}" for k,v in kw.items()); print(f"[{tag}]{(' '+s) if s else ''}", flush=True)
-
-# ---- Constantes
 LURE_PORT, SSH_PORT = 443, 2222
-PREAMBULE = [1,0,1,0,1,0,1,0]     # 0xAA
-WIRE_LEN_FIXED  = 51              # 1|nonce12|ctag38
-WIRE_LEN_LEGACY = 53              # 1|nonce12|len2|ctagXX
-BITS_FIXED      = len(PREAMBULE) + 8*WIRE_LEN_FIXED
-ANTI_REPLAY_S   = 90
-OPEN_TTL_S      = 60
-LOG_PATH        = "/var/log/portknock/poc5_server.jsonl"
+PREAMBULE = [1,0,1,0,1,0,1,0]             # 0xAA
+WIRE_LEN_FIXED, WIRE_LEN_LEGACY = 51, 53  # FAST / LEGACY
+BITS_FIXED = len(PREAMBULE) + 8*WIRE_LEN_FIXED
+ANTI_REPLAY_S, OPEN_TTL_S = 90, 60
+LOG_PATH = "/var/log/portknock/poc5_server.jsonl"
 NFT_TABLE, NFT_CHAIN_INPUT, NFT_SET_ALLOWED = "knock5", "inbound", "allowed"
 MASTER_SECRET_PATH = "/etc/portknock/secret"
-USER_COPY_FMT      = "{home}/.config/portknock/{name}"
+USER_COPY_FMT = "{home}/.config/portknock/{name}"
 
 arrivees, derniers, ips_autorisees = {}, {}, {}
 stop_evt = threading.Event()
 _sshd = None
 
-# ---- util sys
+# ---------- utils install ----------
 def _run(*cmd): return subprocess.run(list(cmd), text=True, capture_output=True)
 def _pip(*p):
     try: subprocess.run([sys.executable,"-m","pip","install","-q",*p], check=True); return True
     except Exception: return False
 def _apt(*p):
     if not shutil.which("apt"): return False
-    try:
-        subprocess.run(["sudo","apt","update"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["sudo","apt","install","-y",*p], check=False); return True
+    try: subprocess.run(["sudo","apt","update"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception: pass
+    try: subprocess.run(["sudo","apt","install","-y",*p], check=False); return True
     except Exception: return False
 def _dnf(*p):
     if not shutil.which("dnf"): return False
@@ -58,11 +54,9 @@ def _pacman(*p):
 def ensure_pydeps():
     try: from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa
     except Exception:
-        LOG("BOOT", step="install_cryptography")
         _pip("cryptography") or _apt("python3-cryptography") or _dnf("python3-cryptography") or _pacman("python-cryptography")
     try: import scapy.all  # noqa
     except Exception:
-        LOG("BOOT", step="install_scapy")
         _pip("scapy") or _apt("python3-scapy") or _dnf("python3-scapy") or _pacman("python-scapy")
 
 def ensure_sysbins():
@@ -74,7 +68,7 @@ def ensure_sysbins():
 def must_root():
     if os.geteuid()!=0: print("[ERREUR] Lancer avec sudo.", file=sys.stderr); sys.exit(1)
 
-# ---- secrets
+# ---------- secrets ----------
 def b64_read(raw:str)->bytes:
     tok = raw.strip().split()[0] if raw.strip() else ""
     try: return base64.b64decode(tok, validate=True)
@@ -92,7 +86,7 @@ def load_or_create_master_secret()->bytes:
     return sec
 
 def copy_secret_for_user(name:str, content:str):
-    sudo_user=os.environ.get("SUDO_USER") or __import__("getpass").getpass.getuser()
+    sudo_user=os.environ.get("SUDO_USER") or getpass.getuser()
     try:
         pw=pwd.getpwnam(sudo_user); home,uid,gid=pw.pw_dir,pw.pw_uid,pw.pw_gid
     except Exception:
@@ -103,7 +97,7 @@ def copy_secret_for_user(name:str, content:str):
     if uid is not None: os.chown(dst,uid,gid)
     LOG("READY", copy_secret=dst)
 
-# ---- firewall/nft/sshd
+# ---------- firewall / nft / sshd ----------
 def firewall_open_if_needed():
     if shutil.which("ufw"):
         st=_run("bash","-lc","ufw status | grep -i active || true").stdout
@@ -159,7 +153,7 @@ def stop_sshd():
         except: _sshd.kill()
         LOG("SSHD", status="stopped")
 
-# ---- logs
+# ---------- logs ----------
 def jlog(event, **fields):
     row={"ts":datetime.utcnow().isoformat()+"Z","event":event}; row.update(fields)
     try:
@@ -167,7 +161,7 @@ def jlog(event, **fields):
         with open(LOG_PATH,"a") as f: f.write(json.dumps(row, ensure_ascii=False)+"\n")
     except Exception: pass
 
-# ---- outils bits
+# ---------- helpers bits / seuil ----------
 def _bits_to_bytes(bits):
     if len(bits)%8: return b""
     out=bytearray()
@@ -175,31 +169,42 @@ def _bits_to_bytes(bits):
         out.append(int("".join(map(str,bits[i:i+8])),2))
     return bytes(out)
 
-# ---- seuil basé sur le préambule
-def derive_threshold_from_preamble(deltas_slice):
-    """Retourne (threshold, hi, lo, diff)."""
-    hi_vals = [deltas_slice[i] for i,b in enumerate(PREAMBULE) if b==1]
-    lo_vals = [deltas_slice[i] for i,b in enumerate(PREAMBULE) if b==0]
-    if not hi_vals or not lo_vals:
-        m = median(deltas_slice)
-        return m, m, m, 0.0
-    hi, lo = median(hi_vals), median(lo_vals)
-    if hi < lo:
-        hi, lo = lo, hi
-    thr = (hi + lo) / 2.0
-    diff = abs(hi - lo)
-    return thr, hi, lo, diff
+def derive_threshold_from_preamble(w):
+    hi = [w[i] for i,b in enumerate(PREAMBULE) if b==1]
+    lo = [w[i] for i,b in enumerate(PREAMBULE) if b==0]
+    if not hi or not lo:
+        m = median(w); return m, m, m, 0.0
+    mhi, mlo = median(hi), median(lo)
+    if mhi < mlo: mhi, mlo = mlo, mhi
+    thr = (mhi + mlo)/2.0
+    return thr, mhi, mlo, abs(mhi-mlo)
 
-def classify_with_threshold(deltas_slice, thr):
-    return [1 if d>thr else 0 for d in deltas_slice]
+def classify_with_threshold(d, thr): return [1 if x>thr else 0 for x in d]
 
-# ---- SPA decrypt (51/53)
+# ---------- détection par corrélation ----------
+def find_candidates_corr(deltas, max_k=32):
+    t = [1,-1,1,-1,1,-1,1,-1]
+    res = []
+    n = len(deltas)
+    if n < 8: return []
+    for i in range(0, n-8):
+        w = deltas[i:i+8]
+        mu = sum(w)/8.0
+        score = sum((w[j]-mu)*t[j] for j in range(8))
+        amp = max(w)-min(w)
+        res.append((score*amp, i, amp, score))
+    res.sort(key=lambda x: x[0], reverse=True)
+    # seuil amplitude minimal pour éviter le bruit (adaptatif + borne plancher)
+    med = median(deltas) if deltas else 0.01
+    min_amp = max(0.002, 0.05*med)
+    return [i for _, i, amp, _ in res[:max_k] if amp > min_amp]
+
+# ---------- SPA decrypt ----------
 def spa_parse_wire(wire: bytes, aes_key: bytes, hmac_key: bytes):
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     try:
-        if len(wire) < 1+12+16: LOG("SPA_WIRE_TOO_SHORT", n=len(wire)); return None
-        v = wire[0]
-        if v != 0x01: LOG("SPA_BAD_VER", v=v); return None
+        if len(wire) < 1+12+16: return None
+        if wire[0] != 0x01:     return None
         nonce = wire[1:13]
         if len(wire) == WIRE_LEN_FIXED:
             ctag = wire[13:]
@@ -207,100 +212,70 @@ def spa_parse_wire(wire: bytes, aes_key: bytes, hmac_key: bytes):
             clen = struct.unpack("!H", wire[13:15])[0]
             ctag = wire[15:15+clen]
         else:
-            LOG("SPA_WIRE_LEN_UNK", n=len(wire)); return None
+            return None
         pt = AESGCM(aes_key).decrypt(nonce, ctag, None)  # 22 bytes: t(4)|d(2)|mac16
-        if len(pt) != 22: LOG("SPA_PT_LEN", n=len(pt)); return None
+        if len(pt) != 22: return None
         t, d = struct.unpack("!IH", pt[:6]); sig = pt[6:22]
         exp = hmac.new(hmac_key, pt[:6], hashlib.sha256).digest()[:16]
-        if sig != exp: LOG("HMAC_BAD"); return None
-        if abs(int(time.time()) - int(t)) > ANTI_REPLAY_S: LOG("SPA_STALE"); return None
+        if sig != exp: return None
+        if abs(int(time.time()) - int(t)) > ANTI_REPLAY_S: return None
         return {"timestamp": int(t), "duration": int(d)}
-    except Exception as e:
-        LOG("SPA_ERROR", err=str(e)); return None
+    except Exception:
+        return None
 
 def try_decode_for_ip(src_ip, deltas, aes_key, hmac_key):
-    if len(deltas) < len(PREAMBULE)+8:
+    if len(deltas) < len(PREAMBULE)+8: return False
+
+    cands = find_candidates_corr(deltas)
+    if not cands:
+        if len(deltas) > 2000: deltas[:] = deltas[-1000:]
         return False
 
-    rough_thr = median(deltas)
-    rough_bits = [1 if d>rough_thr else 0 for d in deltas]
-    n, m = len(rough_bits), len(PREAMBULE)
-    candidates = [i for i in range(0, n-m+1) if rough_bits[i:i+m]==PREAMBULE]
-    if not candidates:
-        if len(deltas) > 2000:
-            deltas[:] = deltas[-1000:]
-        return False
-
-    for idx in candidates:
-        pre_slice = deltas[idx:idx+len(PREAMBULE)]
-        thr, hi, lo, diff = derive_threshold_from_preamble(pre_slice)
+    for idx in cands:
+        if idx+len(PREAMBULE) > len(deltas): continue
+        pre = deltas[idx:idx+len(PREAMBULE)]
+        thr, hi, lo, diff = derive_threshold_from_preamble(pre)
         if max(hi, lo) and diff < 0.2*max(hi, lo):
-            LOG("PROFILE", ip=src_ip, advise="safe", hi=f"{hi:.4f}", lo=f"{lo:.4f}", diff=f"{diff:.4f}")
+            # pas assez de contraste, laisse tomber ce candidat
             continue
 
-        seg_len = len(PREAMBULE) + 8*WIRE_LEN_FIXED
-        if len(deltas) - idx >= seg_len:
-            seg = deltas[idx:idx+seg_len]
+        # --- FAST (416)
+        need = len(PREAMBULE)+8*WIRE_LEN_FIXED
+        if len(deltas)-idx >= need:
+            seg = deltas[idx:idx+need]
             bits = classify_with_threshold(seg, thr)
             data = _bits_to_bytes(bits[len(PREAMBULE):])
-            if not data or data[0] != 0x01:
-                continue
-            LOG("CAND", head=data[:4].hex(), thr=f"{thr:.5f}", hi=f"{hi:.5f}", lo=f"{lo:.5f}", diff=f"{diff:.5f}")
-            spa = spa_parse_wire(data, aes_key, hmac_key)
-            if spa:
-                deltas.clear()
-                ttl = int(spa.get("duration", OPEN_TTL_S)) or OPEN_TTL_S
-                nft_add_allowed(src_ip, ttl)
-                return True
-
-        after_bits = classify_with_threshold(deltas[idx+len(PREAMBULE):], thr)
-        if len(after_bits) >= 16:
-            L = int("".join(map(str, after_bits[:16])), 2)
-            need = len(PREAMBULE) + 16 + 8*L
-            if len(deltas) - idx >= need:
-                seg = deltas[idx:idx+need]
-                bits = classify_with_threshold(seg, thr)
-                msg = _bits_to_bytes(bits[len(PREAMBULE)+16:])
-                if not msg or msg[0] != 0x01:
-                    continue
-                LOG("CAND", head=msg[:4].hex(), thr=f"{thr:.5f}", hi=f"{hi:.5f}", lo=f"{lo:.5f}", diff=f"{diff:.5f}")
-                spa = spa_parse_wire(msg, aes_key, hmac_key)
+            if data and data[0]==0x01:
+                LOG("CAND", ip=src_ip, head=data[:4].hex(), thr=f"{thr:.5f}", hi=f"{hi:.5f}", lo=f"{lo:.5f}")
+                spa = spa_parse_wire(data, aes_key, hmac_key)
                 if spa:
                     deltas.clear()
                     ttl = int(spa.get("duration", OPEN_TTL_S)) or OPEN_TTL_S
                     nft_add_allowed(src_ip, ttl)
                     return True
 
-    if len(deltas) > 2*BITS_FIXED:
-        deltas[:] = deltas[-BITS_FIXED:]
+        # --- LEGACY (len sur 16 bits)
+        after = classify_with_threshold(deltas[idx+len(PREAMBULE):], thr)
+        if len(after) >= 16:
+            L = int("".join(map(str, after[:16])), 2)
+            need = len(PREAMBULE)+16+8*L
+            if len(deltas)-idx >= need:
+                seg = deltas[idx:idx+need]
+                bits = classify_with_threshold(seg, thr)
+                msg = _bits_to_bytes(bits[len(PREAMBULE)+16:])
+                if msg and msg[0]==0x01:
+                    LOG("CAND", ip=src_ip, head=msg[:4].hex(), thr=f"{thr:.5f}", hi=f"{hi:.5f}", lo=f"{lo:.5f}")
+                    spa = spa_parse_wire(msg, aes_key, hmac_key)
+                    if spa:
+                        deltas.clear()
+                        ttl = int(spa.get("duration", OPEN_TTL_S)) or OPEN_TTL_S
+                        nft_add_allowed(src_ip, ttl)
+                        return True
+
+    if len(deltas) > 2*BITS_FIXED: deltas[:] = deltas[-BITS_FIXED:]
     return False
 
-# ---- selftest
-def selftest():
-    LOG("SELFTEST", step="start")
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    master=load_or_create_master_secret()
-    aes_key=hashlib.sha256(master+b"|AES").digest()
-    hmac_key=hashlib.sha256(master+b"|HMAC").digest()
-    t=int(time.time()); d=60
-    head=struct.pack("!IH", t, d)
-    sig=hmac.new(hmac_key, head, hashlib.sha256).digest()[:16]
-    pt=head+sig
-    nonce=os.urandom(12); ctag=AESGCM(aes_key).encrypt(nonce, pt, None)
-    wire=b"\x01"+nonce+ctag
-    bits=PREAMBULE+[int(b) for byte in wire for b in f"{byte:08b}"]
-    d0,d1=0.02,0.06
-    deltas=[d1 if b else d0 for b in bits]
-    lst=deltas[:]
-    global nft_add_allowed
-    orig=nft_add_allowed
-    nft_add_allowed=lambda ip,ttl: LOG("SELFTEST", ip=ip, ttl=ttl)
-    ok=try_decode_for_ip("127.0.0.1", lst, aes_key, hmac_key)
-    nft_add_allowed=orig
-    LOG("SELFTEST", ok=int(ok))
-    return ok
-
-# ---- sniff multi-ifaces (Scapy)
+# ---------- sniff multi-ifaces ----------
 def pick_ifaces(user_value):
     if user_value: return [i.strip() for i in user_value.split(",") if i.strip()]
     try:
@@ -327,7 +302,7 @@ def start_sniffer_thread(iface, aes_key, hmac_key):
             f=int(p[TCP].flags)
             if (f & 0x02)==0 or (f & 0x10)!=0: return  # SYN sans ACK
             src=p[IP].src
-            now=float(p.time)
+            now=float(p.time)  # PRECIS: timestamp pcap
             last=derniers.get(src); derniers[src]=now
             if last is None: arrivees.setdefault(src, []); LOG("PKT", ip=src, first=1); return
             lst=arrivees.setdefault(src, []); lst.append(now-last)
@@ -343,25 +318,26 @@ def start_sniffer_thread(iface, aes_key, hmac_key):
                                             stop_filter=lambda p: stop_evt.is_set()), daemon=True)
     t.start(); return t
 
+# ---------- cleanup ----------
+def nft_delete_table(): _run("bash","-lc",f"nft list table inet {NFT_TABLE} >/dev/null 2>&1 && nft delete table inet {NFT_TABLE} || true")
 def cleanup():
     try: nft_delete_table()
     except Exception: pass
-    try: stop_sshd()
+    try:
+        global _sshd
+        if _sshd and _sshd.poll() is None:
+            _sshd.terminate()
+            try:_sshd.wait(2)
+            except: _sshd.kill()
     except Exception: pass
     LOG("CLEANUP"); jlog("server_stop")
 
-# ---- main
+# ---------- main ----------
 def main():
     import argparse
     ap=argparse.ArgumentParser()
     ap.add_argument("--iface", default=None, help="Interfaces à sniffer (ex: 'lo' ou 'lo,eth0')")
-    ap.add_argument("--selftest", action="store_true", help="séquence synthétique de test")
     args=ap.parse_args()
-
-    if args.selftest:
-        must_root(); ensure_pydeps()
-        ok=selftest()
-        sys.exit(0 if ok else 1)
 
     LOG("BOOT", text="starting"); must_root(); ensure_pydeps(); ensure_sysbins(); firewall_open_if_needed()
 
