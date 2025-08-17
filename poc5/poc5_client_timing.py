@@ -2,12 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 POC5 — Client covert channel + SPA AES-GCM
-- Par défaut: canal 'win' (nibbles via TCP.window) → fiable, rapide
-- Optionnel: canal 'timing' (héritage POC5)
-Usage simple:
+Par défaut : canal 'win' (fiable). Canal 'timing' dispo via --channel timing.
+Usage simple :
   sudo python3 poc5_client_timing.py 127.0.0.1
 """
-
 import os, sys, time, hmac, hashlib, base64, random, socket, subprocess, shutil, argparse, getpass, traceback, struct
 from typing import List
 from scapy.all import IP, TCP, send  # type: ignore
@@ -16,11 +14,9 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # type: ignore
 def LOG(t, **kw): print(f"[{t}]"+(" "+" ".join(f"{k}={v}" for k,v in kw.items()) if kw else ""), flush=True)
 
 LURE_PORT, SSH_PORT = 443, 2222
-# Timing
 PREAMBULE = [1,0,1,0,1,0,1,0]
-# Window
 WIN_BASE = 4096
-WIN_PREAMBLE = [0xC, 0xA, 0xF, 0xE]  # "CAFE"
+WIN_PREAMBLE = [0xC, 0xA, 0xF, 0xE]
 SECRET_FILE = os.path.expanduser("~/.config/portknock/secret")
 LOCAL_SECRET = "/etc/portknock/secret"
 
@@ -78,13 +74,9 @@ def send_timing(bits:List[int], dst:str, d0:float, d1:float, iface:str|None):
 
 # ---------- canal window (nibbles) ----------
 def bytes_to_nibbles(b:bytes)->List[int]:
-    out=[]
-    for x in b:
-        out.append((x>>4)&0xF); out.append(x&0xF)
-    return out
+    out=[];  [out.extend(((x>>4)&0xF, x&0xF)) for x in b];  return out
 
 def send_win(payload:bytes, dst:str, iface:str|None, delay:float=0.003):
-    # séquence : PRE (4 nibbles) + LEN (16 bits -> 4 nibbles) + PAYLOAD (2*nibbles)
     nibb = WIN_PREAMBLE + [ (len(payload)>>12)&0xF, (len(payload)>>8)&0xF, (len(payload)>>4)&0xF, len(payload)&0xF ] + bytes_to_nibbles(payload)
     sport=random.randint(1024,65000); seq0=random.randint(0,2**32-1)
     total=len(nibb); step=max(1,total//20)
@@ -100,7 +92,7 @@ def main():
     ap=argparse.ArgumentParser(description="POC5 client (win|timing)")
     ap.add_argument("server")
     ap.add_argument("--duration", type=int, default=60)
-    ap.add_argument("--channel", choices=["win","timing"], default=None, help="défaut=win (fiable)")
+    ap.add_argument("--channel", choices=["win","timing"], default=None)
     ap.add_argument("--profile", choices=["fast","safe"], default=None, help="[timing] défaut: safe si loopback")
     ap.add_argument("--d0", type=float, default=None, help="[timing] low delay")
     ap.add_argument("--d1", type=float, default=None, help="[timing] high delay")
@@ -127,21 +119,4 @@ def main():
         bits=build_frame(wire)
         LOG("INFO", channel="timing", target=dst_ip, bytes=len(wire), bits=len(bits), d0=d0, d1=d1, profile=prof, iface=(iface or "auto"))
         if args.dry_run: LOG("DRY", bits="".join(str(b) for b in bits[:32])); return
-        send_timing(bits, dst_ip, d0, d1, iface=iface)
-    else:
-        LOG("INFO", channel="win", target=dst_ip, bytes=len(wire), iface=(iface or "auto"))
-        if args.dry_run: 
-            nibb=bytes_to_nibbles(wire)[:8]
-            LOG("DRY", first_nibbles="".join(hex(x)[2:] for x in nibb))
-            return
-        send_win(wire, dst_ip, iface=iface, delay=0.003 if is_loopback else 0.005)
-
-    if not args.no_ssh:
-        ssh_user=os.environ.get("SUDO_USER") or getpass.getuser()
-        time.sleep(0.8)
-        os.execvp("ssh", ["ssh","-p",str(SSH_PORT),"-o","StrictHostKeyChecking=accept-new", f"{ssh_user}@{args.server}"])
-
-if __name__=="__main__":
-    try: main()
-    except Exception:
-        LOG("FATAL", trace=traceback.format_exc()); sys.exit(1)
+        send_timing(bits, dst_ip, d0, d1, iface
