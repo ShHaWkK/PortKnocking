@@ -76,6 +76,7 @@ def main():
     ap.add_argument("--d1", type=float, default=None)
     ap.add_argument("--iface", default=None)
     ap.add_argument("--no-ssh", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
     args=ap.parse_args()
 
     if args.d0 is None or args.d1 is None:
@@ -90,6 +91,9 @@ def main():
     wire=build_wire(aes,mac,args.duration); bits=build_frame(wire)
 
     LOG("INFO", target=dst_ip, bytes=len(wire), bits=len(bits), d0=d0, d1=d1, profile=args.profile)
+    if args.dry_run:
+        LOG("DRY", bits="".join(str(b) for b in bits[:32]))
+        return
     send_timing(bits, dst_ip, d0, d1, iface=args.iface)
 
     if not args.no_ssh:

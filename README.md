@@ -30,3 +30,17 @@ Si la séquence est correcte, le serveur ajoute temporairement une règle
 pip3 install scapy
 ```
 
+## Tests POC5
+
+```bash
+# auto-test du décodage
+sudo python3 poc5/poc5_server_timing.py --selftest
+
+# client sans émission (aperçu des bits)
+sudo python3 poc5/poc5_client_timing.py 127.0.0.1 --dry-run
+
+# boucle locale
+sudo python3 poc5/poc5_server_timing.py --iface lo &
+sudo python3 poc5/poc5_client_timing.py 127.0.0.1
+```
+

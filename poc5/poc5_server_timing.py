@@ -177,14 +177,18 @@ def _bits_to_bytes(bits):
 
 # ---- seuil basé sur le préambule
 def derive_threshold_from_preamble(deltas_slice):
-    # positions des 1 et des 0 dans le préambule 10101010
+    """Retourne (threshold, hi, lo, diff)."""
     hi_vals = [deltas_slice[i] for i,b in enumerate(PREAMBULE) if b==1]
     lo_vals = [deltas_slice[i] for i,b in enumerate(PREAMBULE) if b==0]
-    if not hi_vals or not lo_vals: return median(deltas_slice)
+    if not hi_vals or not lo_vals:
+        m = median(deltas_slice)
+        return m, m, m, 0.0
     hi, lo = median(hi_vals), median(lo_vals)
-    if hi < lo: hi, lo = lo, hi
+    if hi < lo:
+        hi, lo = lo, hi
     thr = (hi + lo) / 2.0
-    return thr
+    diff = abs(hi - lo)
+    return thr, hi, lo, diff
 
 def classify_with_threshold(deltas_slice, thr):
     return [1 if d>thr else 0 for d in deltas_slice]
@@ -215,58 +219,86 @@ def spa_parse_wire(wire: bytes, aes_key: bytes, hmac_key: bytes):
         LOG("SPA_ERROR", err=str(e)); return None
 
 def try_decode_for_ip(src_ip, deltas, aes_key, hmac_key):
-    if len(deltas) < len(PREAMBULE)+8: return False
-
-    # 1) on cherche le motif du préambule avec un "rough" binaire
-    rough_thr = median(deltas)  # seuil grossier
-    rough_bits = [1 if d>rough_thr else 0 for d in deltas]
-
-    # première occurrence du préambule
-    n, m = len(rough_bits), len(PREAMBULE)
-    idx = -1
-    for i in range(0, n-m+1):
-        if rough_bits[i:i+m] == PREAMBULE:
-            idx = i; break
-    if idx < 0: 
-        if len(deltas) > 2000: deltas[:] = deltas[-1000:]
+    if len(deltas) < len(PREAMBULE)+8:
         return False
 
-    # 2) calcule un SEUIL **à partir des 8 deltas du préambule**
-    pre_slice = deltas[idx:idx+len(PREAMBULE)]
-    thr = derive_threshold_from_preamble(pre_slice)
+    rough_thr = median(deltas)
+    rough_bits = [1 if d>rough_thr else 0 for d in deltas]
+    n, m = len(rough_bits), len(PREAMBULE)
+    candidates = [i for i in range(0, n-m+1) if rough_bits[i:i+m]==PREAMBULE]
+    if not candidates:
+        if len(deltas) > 2000:
+            deltas[:] = deltas[-1000:]
+        return False
 
-    # 3) essaie format FAST (416 bits)
-    seg_len = len(PREAMBULE) + 8*WIRE_LEN_FIXED
-    if len(deltas) - idx >= seg_len:
-        seg = deltas[idx:idx+seg_len]
-        bits = classify_with_threshold(seg, thr)
-        data = _bits_to_bytes(bits[len(PREAMBULE):])
-        spa  = spa_parse_wire(data, aes_key, hmac_key)
-        if spa:
-            deltas.clear()
-            ttl = int(spa.get("duration", OPEN_TTL_S)) or OPEN_TTL_S
-            nft_add_allowed(src_ip, ttl)
-            return True
+    for idx in candidates:
+        pre_slice = deltas[idx:idx+len(PREAMBULE)]
+        thr, hi, lo, diff = derive_threshold_from_preamble(pre_slice)
+        if max(hi, lo) and diff < 0.2*max(hi, lo):
+            LOG("PROFILE", ip=src_ip, advise="safe", hi=f"{hi:.4f}", lo=f"{lo:.4f}", diff=f"{diff:.4f}")
+            continue
 
-    # 4) sinon format LEGACY (len sur 16 bits)
-    after_bits = classify_with_threshold(deltas[idx+len(PREAMBULE):], thr)
-    if len(after_bits) >= 16:
-        L = int("".join(map(str, after_bits[:16])), 2)
-        need = len(PREAMBULE) + 16 + 8*L
-        if len(deltas) - idx >= need:
-            seg = deltas[idx:idx+need]
+        seg_len = len(PREAMBULE) + 8*WIRE_LEN_FIXED
+        if len(deltas) - idx >= seg_len:
+            seg = deltas[idx:idx+seg_len]
             bits = classify_with_threshold(seg, thr)
-            msg = _bits_to_bytes(bits[len(PREAMBULE)+16:])
-            spa = spa_parse_wire(msg, aes_key, hmac_key)
+            data = _bits_to_bytes(bits[len(PREAMBULE):])
+            if not data or data[0] != 0x01:
+                continue
+            LOG("CAND", head=data[:4].hex(), thr=f"{thr:.5f}", hi=f"{hi:.5f}", lo=f"{lo:.5f}", diff=f"{diff:.5f}")
+            spa = spa_parse_wire(data, aes_key, hmac_key)
             if spa:
                 deltas.clear()
                 ttl = int(spa.get("duration", OPEN_TTL_S)) or OPEN_TTL_S
                 nft_add_allowed(src_ip, ttl)
                 return True
 
-    # 5) nettoyage mémoire
-    if len(deltas) > 2*BITS_FIXED: deltas[:] = deltas[-BITS_FIXED:]
+        after_bits = classify_with_threshold(deltas[idx+len(PREAMBULE):], thr)
+        if len(after_bits) >= 16:
+            L = int("".join(map(str, after_bits[:16])), 2)
+            need = len(PREAMBULE) + 16 + 8*L
+            if len(deltas) - idx >= need:
+                seg = deltas[idx:idx+need]
+                bits = classify_with_threshold(seg, thr)
+                msg = _bits_to_bytes(bits[len(PREAMBULE)+16:])
+                if not msg or msg[0] != 0x01:
+                    continue
+                LOG("CAND", head=msg[:4].hex(), thr=f"{thr:.5f}", hi=f"{hi:.5f}", lo=f"{lo:.5f}", diff=f"{diff:.5f}")
+                spa = spa_parse_wire(msg, aes_key, hmac_key)
+                if spa:
+                    deltas.clear()
+                    ttl = int(spa.get("duration", OPEN_TTL_S)) or OPEN_TTL_S
+                    nft_add_allowed(src_ip, ttl)
+                    return True
+
+    if len(deltas) > 2*BITS_FIXED:
+        deltas[:] = deltas[-BITS_FIXED:]
     return False
+
+# ---- selftest
+def selftest():
+    LOG("SELFTEST", step="start")
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    master=load_or_create_master_secret()
+    aes_key=hashlib.sha256(master+b"|AES").digest()
+    hmac_key=hashlib.sha256(master+b"|HMAC").digest()
+    t=int(time.time()); d=60
+    head=struct.pack("!IH", t, d)
+    sig=hmac.new(hmac_key, head, hashlib.sha256).digest()[:16]
+    pt=head+sig
+    nonce=os.urandom(12); ctag=AESGCM(aes_key).encrypt(nonce, pt, None)
+    wire=b"\x01"+nonce+ctag
+    bits=PREAMBULE+[int(b) for byte in wire for b in f"{byte:08b}"]
+    d0,d1=0.02,0.06
+    deltas=[d1 if b else d0 for b in bits]
+    lst=deltas[:]
+    global nft_add_allowed
+    orig=nft_add_allowed
+    nft_add_allowed=lambda ip,ttl: LOG("SELFTEST", ip=ip, ttl=ttl)
+    ok=try_decode_for_ip("127.0.0.1", lst, aes_key, hmac_key)
+    nft_add_allowed=orig
+    LOG("SELFTEST", ok=int(ok))
+    return ok
 
 # ---- sniff multi-ifaces (Scapy)
 def pick_ifaces(user_value):
@@ -295,7 +327,7 @@ def start_sniffer_thread(iface, aes_key, hmac_key):
             f=int(p[TCP].flags)
             if (f & 0x02)==0 or (f & 0x10)!=0: return  # SYN sans ACK
             src=p[IP].src
-            now=time.monotonic()
+            now=float(p.time)
             last=derniers.get(src); derniers[src]=now
             if last is None: arrivees.setdefault(src, []); LOG("PKT", ip=src, first=1); return
             lst=arrivees.setdefault(src, []); lst.append(now-last)
@@ -321,11 +353,17 @@ def cleanup():
 # ---- main
 def main():
     import argparse
-    LOG("BOOT", text="starting"); must_root(); ensure_pydeps(); ensure_sysbins(); firewall_open_if_needed()
-
     ap=argparse.ArgumentParser()
     ap.add_argument("--iface", default=None, help="Interfaces à sniffer (ex: 'lo' ou 'lo,eth0')")
+    ap.add_argument("--selftest", action="store_true", help="séquence synthétique de test")
     args=ap.parse_args()
+
+    if args.selftest:
+        must_root(); ensure_pydeps()
+        ok=selftest()
+        sys.exit(0 if ok else 1)
+
+    LOG("BOOT", text="starting"); must_root(); ensure_pydeps(); ensure_sysbins(); firewall_open_if_needed()
 
     master=load_or_create_master_secret()
     aes_key=hashlib.sha256(master+b"|AES").digest()
