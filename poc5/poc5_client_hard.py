@@ -177,7 +177,7 @@ def main():
     print("ICMP echo")
     knock_icmp(dst_ip)
 
-    # SPA signé → QR
+    # SPA signé => QR
     ts = int(time.time())
     nonce = b64u(os.urandom(16))
     payload = {"kid":kid, "ts":ts, "duration":int(args.duration), "nonce":nonce}
