@@ -1,89 +1,103 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-POC5 — Serveur « hard »
-- Séquence : TCP SYN -> UDP -> ICMP Echo
-- Rotation P1/P2 par HMAC(secret, window) ; tolère la fenêtre N-1
-- API HTTP (port 45446) : GET /ports, POST /enroll, POST /knock (SPA signé Ed25519)
-- TOTP optionnel (--totp-secret <fichier base32>)
-- Rate-limit par IP (API et sniff séparés)
-- Ouverture via nftables (@allowed timeout) du SSH:2222
-Usage : sudo python3 poc5_server_hard.py 127.0.0.1 --iface lo [--totp-secret /etc/portknock/totp_base32]
+POC5 — Serveur « hard » (QR code)
+- Séquence: TCP SYN -> UDP -> ICMP Echo (fenêtre N ou N-1)
+- Ports P1/P2 dérivés par HMAC(secret, window_id) + rotation périodique
+- API HTTP: GET /ports, POST /enroll, POST /knockqr (PNG base64 d’un QR)
+- Le QR encode un SPA JSON signé Ed25519 (et TOTP optionnel)
+- À validation: ajout ip source dans @allowed (nftables) avec timeout → SSH:2222
 """
 
 import os, sys, time, json, base64, argparse, signal, threading, struct, hashlib, hmac, subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Tuple, Optional
 
-# ---- paramètres
-SSH_PORT          = 2222
-HTTP_PORT         = 45446     # <- demandé
-NFT_TABLE         = "knock5"
-NFT_CHAIN         = "inbound"
-NFT_SET_ALLOWED   = "allowed"
-
-OPEN_TTL_S        = 60        # autorisation SSH
-STEP_TTL_S        = 10        # délai max entre étapes
-PENDING_TTL_S     = 8         # fenêtre SPA après ICMP
-ROTATE_PERIOD_S   = 30        # rotation P1/P2 toutes 30s
+# --- paramètres
+SSH_PORT           = 2222
+DEFAULT_HTTP_PORT  = 45445
+NFT_TABLE          = "knock5"
+NFT_CHAIN          = "inbound"
+NFT_SET_ALLOWED    = "allowed"
+OPEN_TTL_S         = 60
+STEP_TTL_S         = 10
+PENDING_TTL_S      = 8
+ROTATE_PERIOD_S    = 30
 PORT_MIN, PORT_MAX = 47000, 48999
 
-MASTER_SECRET_PATH = "/etc/portknock/secret"        # base64
-ENROLL_DB          = "/var/lib/poc5/enrolled.json"  # {kid: pub_raw_b64u}
+MASTER_SECRET_PATH = "/etc/portknock/secret"   # base64
+ENROLL_DB          = "/etc/portknock/keys.json"  # {kid: raw_pub_b64u}
 
-# rate-limit par canal (token bucket)
-RL_API_CAP,   RL_API_REFILL   = 20.0, 1.0   # 20 req, plein en ~1s
-RL_SNIFF_CAP, RL_SNIFF_REFILL = 80.0, 1.0   # 80 paquets/s
+# rate-limit API (token bucket)
+RL_CAPACITY = 12.0
+RL_REFILL   = 12.0   # jetons/s
 
-# ---- deps
+# --- deps externes
+def need(msg: str):
+    print(msg, file=sys.stderr); sys.exit(1)
+
 try:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 except Exception:
-    print("Installer : pip install cryptography", file=sys.stderr); sys.exit(1)
+    need("Installez: pip install cryptography")
 try:
-    from scapy.all import sniff, IP, TCP, UDP, ICMP, get_if_list  # type: ignore
+    from scapy.all import sniff, IP, TCP, UDP, ICMP   # type: ignore
 except Exception:
-    print("Installer : pip install scapy", file=sys.stderr); sys.exit(1)
+    need("Installez: pip install scapy")
+try:
+    from PIL import Image                             # type: ignore
+except Exception:
+    need("Installez: pip install pillow")
+try:
+    from pyzbar.pyzbar import decode as qr_decode     # type: ignore
+except Exception:
+    # pyzbar nécessite libzbar (Debian/Ubuntu: apt-get install -y libzbar0)
+    need("Installez: apt install libzbar0  puis  pip install pyzbar")
 
-# ---- utilitaires
+# --- utils
 def must_root():
     if os.geteuid()!=0:
-        print("Lancer en root (sudo).", file=sys.stderr); sys.exit(1)
+        print("Lancez en root (sudo).", file=sys.stderr); sys.exit(1)
 
 def b64u(b: bytes) -> str: return base64.urlsafe_b64encode(b).decode().rstrip("=")
 def de_b64u(s: str) -> bytes: return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 def canon_bytes(obj) -> bytes: return json.dumps(obj, separators=(",",":"), sort_keys=True).encode()
 def LOG(tag, **kw): print(f"[{tag}] "+" ".join(f"{k}={v}" for k,v in kw.items()), flush=True)
-def run(cmd: str): return subprocess.run(["bash","-lc",cmd], capture_output=True, text=True)
 
-# ---- TOTP (RFC6238, SHA-1, 6 digits)
-def b32_read(raw: str) -> bytes:
-    tok = "".join(raw.strip().split())
-    return base64.b32decode(tok.upper())
+def run(cmd: str) -> Tuple[int,str,str]:
+    p = subprocess.run(["bash","-lc",cmd], capture_output=True, text=True)
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+# --- TOTP (RFC6238, SHA-1, 6 digits)
+def b32_read(text: str) -> bytes:
+    return base64.b32decode("".join(text.strip().split()).upper())
+
 def totp_now(secret: bytes, for_time: int, step=30, digits=6) -> int:
-    ctr = int(for_time//step)
+    ctr = int(for_time // step)
     msg = struct.pack(">Q", ctr)
-    dig = hmac.new(secret, msg, hashlib.sha1).digest()
-    off = dig[-1] & 0x0F
-    code = ((dig[off] & 0x7F)<<24) | (dig[off+1]<<16) | (dig[off+2]<<8) | dig[off+3]
+    digest = hmac.new(secret, msg, hashlib.sha1).digest()
+    off = digest[-1] & 0x0F
+    code = ((digest[off] & 0x7F)<<24) | (digest[off+1]<<16) | (digest[off+2]<<8) | digest[off+3]
     return code % (10**digits)
+
 def totp_verify(secret: bytes, code: int, now_ts: int) -> bool:
     for k in (-1,0,1):
         if totp_now(secret, now_ts + 30*k) == code:
             return True
     return False
 
-# ---- dérivation déterministe des ports
+# --- dérivation P1/P2
 def derive_port(secret: bytes, label: bytes, lo: int, hi: int) -> int:
-    digest = hmac.new(secret, label, hashlib.sha256).digest()
-    val = int.from_bytes(digest[:2], "big")
+    dig = hmac.new(secret, label, hashlib.sha256).digest()
+    val = int.from_bytes(dig[:2], "big")
     return lo + (val % (hi-lo+1))
 
 def win_id(period: int) -> int: return int(time.time() // period)
 
-# ---- état global
+# --- état global
 class State:
     bind_ip: str = "127.0.0.1"
+    http_port: int = DEFAULT_HTTP_PORT
     ifaces: list = []
     rotate_s: int = ROTATE_PERIOD_S
     step_ttl: int = STEP_TTL_S
@@ -91,29 +105,24 @@ class State:
     open_ttl: int = OPEN_TTL_S
     totp_secret: Optional[bytes] = None
     master: bytes = b""
-    windows: list = []  # [{win,p1,p2,exp}]
-    # progression ip -> (stage, win, last_monotonic)
-    prog: Dict[str, Tuple[int,int,float]] = {}
-    # pending SPA ip -> expiry_monotonic
-    pending: Dict[str, float] = {}
-    # anti-replay nonce -> expiry_monotonic
-    nonces: Dict[str, float] = {}
-    # enrollments kid -> raw public key bytes
-    enrolled: Dict[str, bytes] = {}
-    # rate-limit
-    rl_api: Dict[str, Tuple[float,float]]   = {}
-    rl_sniff: Dict[str, Tuple[float,float]] = {}
+
+    windows: list = []             # [{win,p1,p2,exp}]
+    prog: Dict[str, tuple] = {}    # ip -> (stage, win, last_monotonic)
+    pending: Dict[str, float] = {} # ip -> expiry_monotonic
+    nonces: Dict[str, float] = {}  # (kid:nonce) -> expiry_monotonic
+    enrolled: Dict[str, bytes] = {}# kid -> raw pub
+    api_rl: Dict[str, tuple] = {}  # ip -> (tokens,last_mono)
     stop_evt = threading.Event()
 
 S = State()
 
-# ---- secrets / enroll
+# --- secrets/enroll
 def ensure_master_secret() -> bytes:
     os.makedirs(os.path.dirname(MASTER_SECRET_PATH), exist_ok=True)
     if not os.path.exists(MASTER_SECRET_PATH):
         raw = os.urandom(32)
         open(MASTER_SECRET_PATH,"w").write(base64.b64encode(raw).decode()+"\n")
-        os.chmod(MASTER_SECRET_PATH,0o600)
+        os.chmod(MASTER_SECRET_PATH, 0o600)
         LOG("READY", secret=MASTER_SECRET_PATH, created=1)
     else:
         LOG("READY", secret=MASTER_SECRET_PATH, created=0)
@@ -132,10 +141,10 @@ def load_enrolled():
         S.enrolled = {}
 
 def save_enrolled():
-    data = {kid: b64u(raw) for kid,raw in S.enrolled.items()}
-    json.dump(data, open(ENROLL_DB,"w"))
+    json.dump({kid:b64u(raw) for kid,raw in S.enrolled.items()},
+              open(ENROLL_DB,"w"), indent=2)
 
-# ---- nftables + sshd
+# --- nftables + sshd
 def nft_install():
     run(f"nft list table inet {NFT_TABLE} >/dev/null 2>&1 && nft delete table inet {NFT_TABLE} || true")
     conf=f"""
@@ -153,17 +162,16 @@ def nft_open(ip:str, ttl:int):
     run(f"nft add element inet {NFT_TABLE} {NFT_SET_ALLOWED} '{{ {ip} timeout {ttl}s }}'")
     LOG("OPEN", ip=ip, ttl=ttl)
 
-def nft_cleanup(): run(f"nft list table inet {NFT_TABLE} >/dev/null 2>&1 && nft delete table inet {NFT_TABLE} || true")
-
-def ensure_host_keys(): run("test -f /etc/ssh/ssh_host_ed25519_key || ssh-keygen -A >/dev/null 2>&1 || true")
+def ensure_hostkeys():
+    run("test -f /etc/ssh/ssh_host_ed25519_key || ssh-keygen -A >/dev/null 2>&1 || true")
 
 _sshd=None
 def start_sshd():
     global _sshd
-    ensure_host_keys()
+    ensure_hostkeys()
     cfg=f"Port {SSH_PORT}\nListenAddress 0.0.0.0\nUsePAM yes\nPasswordAuthentication yes\nPidFile /tmp/poc5_sshd.pid\nLogLevel QUIET\n"
     path="/tmp/poc5_sshd.conf"; open(path,"w").write(cfg)
-    _sshd=subprocess.Popen(["/usr/sbin/sshd","-f",path],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    _sshd=subprocess.Popen(["/usr/sbin/sshd","-f",path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     LOG("SSHD", listen=f":{SSH_PORT}")
 
 def stop_sshd():
@@ -173,16 +181,16 @@ def stop_sshd():
         try: _sshd.wait(2)
         except: _sshd.kill()
 
-# ---- rotation P1/P2
+# --- rotation P1/P2
 def roll_ports():
-    w  = win_id(S.rotate_s)
+    w = win_id(S.rotate_s)
     tb = struct.pack("!Q", w)
     p1 = derive_port(S.master, b"p1|"+tb, PORT_MIN, PORT_MAX)
     p2 = derive_port(S.master, b"p2|"+tb, PORT_MIN, PORT_MAX)
     if p2 == p1: p2 = PORT_MIN + ((p1+137) % (PORT_MAX-PORT_MIN+1))
     exp = int(time.time()+S.rotate_s)
     S.windows.append({"win":w,"p1":p1,"p2":p2,"exp":exp})
-    S.windows[:] = S.windows[-2:]  # garder N et N-1
+    S.windows[:] = S.windows[-2:]
     LOG("PORTS", p1=p1, p2=p2, exp=exp)
 
 def rotator_thread():
@@ -194,53 +202,58 @@ def rotator_thread():
             LOG("ROTATE_ERR", err=str(e))
         time.sleep(1)
 
-# ---- rate limit
-def _rl_ok(bucket: Dict[str,Tuple[float,float]], ip:str, cap:float, refill_s:float)->bool:
-    now= time.monotonic()
-    tokens,last = bucket.get(ip,(cap,now))
-    tokens = min(cap, tokens + (now-last)* (cap/refill_s))
+# --- rate limit API
+def rl_ok(ip:str)->bool:
+    now = time.monotonic()
+    tokens,last = S.api_rl.get(ip,(RL_CAPACITY,now))
+    # refill
+    tokens = min(RL_CAPACITY, tokens + (now-last)*RL_REFILL)
     if tokens < 1.0:
-        bucket[ip]=(tokens,now); return False
-    bucket[ip]=(tokens-1.0,now); return True
+        S.api_rl[ip]=(tokens,now); return False
+    S.api_rl[ip]=(tokens-1.0,now); return True
 
-def rl_ok_api(ip:str)->bool:   return _rl_ok(S.rl_api,   ip, RL_API_CAP,   RL_API_REFILL)
-def rl_ok_sniff(ip:str)->bool: return _rl_ok(S.rl_sniff, ip, RL_SNIFF_CAP, RL_SNIFF_REFILL)
+# --- décodage PNG base64 → texte QR
+def qr_text_from_png_b64(png_b64: str) -> str:
+    from io import BytesIO
+    img = Image.open(BytesIO(base64.b64decode(png_b64)))
+    res = qr_decode(img)
+    if not res: raise ValueError("no_qr")
+    return res[0].data.decode()
 
-# ---- API HTTP
+# --- API HTTP
 class Api(BaseHTTPRequestHandler):
-    server_version="poc5/1.0"
-    def log_message(self,*a,**k): return
+    server_version = "poc5/qr/1.0"
+    def log_message(self, *a, **k): return
     def _json(self, code:int, obj:dict):
         raw=json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type","application/json")
         self.send_header("Content-Length",str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
+        self.end_headers(); self.wfile.write(raw)
     def _ip(self)->str: return self.client_address[0]
 
     def do_GET(self):
-        if self.path.split("?")[0]=="/ports":
+        if self.path.split("?")[0] == "/ports":
             cur = S.windows[-1] if S.windows else None
             if not cur: roll_ports(); cur=S.windows[-1]
             self._json(200, {"p1":cur["p1"],"p2":cur["p2"],"expires":cur["exp"],
-                             "rotate":S.rotate_s,"ssh":SSH_PORT,"http":HTTP_PORT,
+                             "rotate":S.rotate_s,"ssh":SSH_PORT,"http":S.http_port,
                              "totp_required": bool(S.totp_secret is not None)})
             return
-        if self.path=="/healthz":
-            self._json(200, {"ok":True}); return
+        if self.path == "/healthz": self._json(200, {"ok":True}); return
         self._json(404, {"error":"not_found"})
 
     def do_POST(self):
-        ip=self._ip()
-        if not rl_ok_api(ip): return self._json(429, {"error":"rate_limited"})
-        ln=int(self.headers.get("Content-Length","0") or "0")
-        data={}
-        if ln>0:
-            try: data=json.loads(self.rfile.read(ln).decode())
-            except Exception: return self._json(400, {"error":"bad_json"})
+        ip = self._ip()
+        if not rl_ok(ip): return self._json(429, {"error":"rate_limited"})
+        ln = int(self.headers.get("Content-Length","0") or "0")
+        try:
+            data = json.loads(self.rfile.read(ln).decode()) if ln>0 else {}
+        except Exception:
+            return self._json(400, {"error":"bad_json"})
 
-        if self.path=="/enroll":
+        # enrôlement (clé publique)
+        if self.path == "/enroll":
             kid=str(data.get("kid",""))[:32]; pub=str(data.get("pubkey",""))
             if not kid or not pub: return self._json(400, {"error":"missing_fields"})
             try:
@@ -250,86 +263,93 @@ class Api(BaseHTTPRequestHandler):
             LOG("ENROLL_OK", ip=ip, kid=kid)
             return self._json(200, {"ok":True})
 
-        if self.path=="/knock":
-            # SPA : {kid, ts, duration, nonce, [totp], sig}
-            kid=str(data.get("kid",""))[:32]; sig_b64=str(data.get("sig",""))
-            if not kid or not sig_b64: return self._json(400, {"error":"missing_fields"})
-            # état pending
-            if S.pending.get(ip,0) < time.monotonic(): return self._json(403, {"error":"not_pending"})
-            # anti-replay nonce
-            nonce=str(data.get("nonce",""))[:64]
-            nowm=time.monotonic()
+        # SPA transporté dans un QR (PNG base64)
+        if self.path == "/knockqr":
+            if ip not in S.pending or S.pending[ip] < time.monotonic():
+                return self._json(403, {"error":"not_pending"})
+
+            png_b64 = str(data.get("qr","") or data.get("qr_b64",""))
+            if not png_b64: return self._json(400, {"error":"missing_qr"})
+
+            try:
+                text = qr_text_from_png_b64(png_b64)
+                spa  = json.loads(text)
+            except Exception:
+                return self._json(400, {"error":"bad_qr"})
+
+            kid = str(spa.get("kid",""))[:32]
+            sig_b64 = str(spa.get("sig",""))
+            if not kid or not sig_b64:
+                return self._json(400, {"error":"missing_fields"})
+
+            # anti-rejeu par nonce
+            nonce = str(spa.get("nonce",""))[:64]
+            nowm  = time.monotonic()
             # purge
-            for k in list(S.nonces.keys()):
+            for k in list(S.nonces):
                 if S.nonces[k] < nowm: S.nonces.pop(k,None)
-            key=f"{kid}:{nonce}"
-            if not nonce or key in S.nonces: return self._json(403, {"error":"replay_nonce"})
-            S.nonces[key]= nowm + 300.0
-            # signature
-            pk_raw=S.enrolled.get(kid)
+            key = f"{kid}:{nonce}"
+            if not nonce or key in S.nonces:
+                return self._json(403, {"error":"replay_nonce"})
+            S.nonces[key] = nowm + 300.0
+
+            # vérif signature
+            pk_raw = S.enrolled.get(kid)
             if not pk_raw: return self._json(403, {"error":"unknown_kid"})
-            pk=Ed25519PublicKey.from_public_bytes(pk_raw)
-            payload={k:v for k,v in data.items() if k!="sig"}
+            pk = Ed25519PublicKey.from_public_bytes(pk_raw)
+            payload = {k:v for k,v in spa.items() if k!="sig"}
             try: pk.verify(de_b64u(sig_b64), canon_bytes(payload))
             except Exception: return self._json(403, {"error":"bad_sig"})
-            # fraicheur
-            ts=int(data.get("ts",0))
-            if ts<=0 or abs(int(time.time())-ts)>90: return self._json(403, {"error":"stale_ts"})
-            # TOTP si requis
+
+            # fraicheur + TOTP
+            ts = int(spa.get("ts",0))
+            if ts<=0 or abs(int(time.time())-ts)>90:
+                return self._json(403, {"error":"stale_ts"})
             if S.totp_secret is not None:
-                try: code=int(str(data.get("totp","")).strip())
+                try: code=int(str(spa.get("totp","")).strip())
                 except Exception: return self._json(403, {"error":"totp_required"})
                 if not totp_verify(S.totp_secret, code, int(time.time())):
                     return self._json(403, {"error":"totp_bad"})
-            # ouverture
-            ttl=max(5, min(3600, int(data.get("duration", S.open_ttl))))
+
+            ttl = max(5, min(3600, int(spa.get("duration", S.open_ttl))))
             nft_open(ip, ttl)
             S.pending.pop(ip, None)
             return self._json(200, {"ok":True, "ttl":ttl})
 
         self._json(404, {"error":"not_found"})
 
-# ---- sniff / progression
+# --- sniff / progression (TCP->UDP->ICMP)
 def handle_pkt(p):
     try:
         if not p.haslayer(IP): return
         if p[IP].dst != S.bind_ip: return
         ip = p[IP].src
-        if not rl_ok_sniff(ip): return
-
-        # TTL progression
         st = S.prog.get(ip)
         nowm = time.monotonic()
         if st and nowm - st[2] > S.step_ttl:
-            S.prog.pop(ip, None); st=None
+            S.prog.pop(ip,None); st=None
 
         wins = S.windows[-2:] if S.windows else []
         if not wins: return
-        wmap = {w["win"]:(w["p1"], w["p2"]) for w in wins}
+        wmap = {w["win"]:(w["p1"],w["p2"]) for w in wins}
 
-        # Step1 TCP SYN vers p1
+        # step1 TCP SYN -> p1
         if p.haslayer(TCP):
             f=int(p[TCP].flags)
             if (f & 0x02) and not (f & 0x10):
                 d=int(p[TCP].dport)
                 for w in wins:
-                    if d == w["p1"]:
-                        S.prog[ip]=(1, w["win"], nowm)
-                        LOG("STEP1", ip=ip)
-                        return
-
-        # Step2 UDP vers p2 dans la même fenêtre
+                    if d==w["p1"]:
+                        S.prog[ip]=(1,w["win"],nowm); LOG("STEP1", ip=ip); return
+        # step2 UDP -> p2 même fenêtre
         if st and st[0]==1 and p.haslayer(UDP):
-            d=int(p[UDP].dport); p1,p2 = wmap.get(st[1], (None,None))
+            d=int(p[UDP].dport); _,p2 = wmap.get(st[1], (None,None))
             if p2 and d==p2:
-                S.prog[ip]=(2, st[1], nowm)
-                LOG("STEP2", ip=ip)
-                return
-
-        # Step3 ICMP Echo
+                S.prog[ip]=(2,st[1],nowm); LOG("STEP2", ip=ip); return
+        # step3 ICMP echo
         if st and st[0]==2 and p.haslayer(ICMP) and int(p[ICMP].type)==8:
-            S.prog.pop(ip, None)
-            S.pending[ip]= time.monotonic() + S.pending_ttl
+            S.prog.pop(ip,None)
+            S.pending[ip] = time.monotonic() + S.pending_ttl
             LOG("PENDING", ip=ip, ttl=f"{S.pending_ttl:.1f}")
             return
 
@@ -340,25 +360,23 @@ def handle_pkt(p):
         LOG("SNIFF_ERR", err=str(e))
 
 def start_sniffer(iface:str):
+    from scapy.all import conf  # type: ignore
     bpf=f"dst host {S.bind_ip} and (tcp or udp or icmp)"
     LOG("LISTEN", iface=iface, bpf=bpf)
     sniff(iface=iface, filter=bpf, prn=handle_pkt, store=False)
 
-# ---- interfaces
+# --- interfaces
 def pick_ifaces(user: Optional[str])->list:
     if user: return [s.strip() for s in user.split(",") if s.strip()]
-    res=[]
-    try:
-        if "lo" in get_if_list(): res.append("lo")
-    except Exception: res.append("lo")
-    r=run("ip route show default | awk '{print $5}' | head -n1")
-    dev=(r.stdout or "").strip()
+    res=["lo"]
+    rc,out,_ = run("ip route show default | awk '{print $5}' | head -n1")
+    dev=(out or "").strip()
     if dev and dev not in res: res.append(dev)
-    return res or ["lo"]
+    return res
 
-# ---- main
+# --- main
 def cleanup():
-    try: nft_cleanup()
+    try: run(f"nft list table inet {NFT_TABLE} >/dev/null 2>&1 && nft delete table inet {NFT_TABLE} || true")
     except Exception: pass
     try: stop_sshd()
     except Exception: pass
@@ -369,35 +387,38 @@ def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("bind_ip")
     ap.add_argument("--iface", default=None, help="ex: lo,eth0")
+    ap.add_argument("--http-port", type=int, default=DEFAULT_HTTP_PORT)
     ap.add_argument("--rotate", type=int, default=ROTATE_PERIOD_S)
     ap.add_argument("--step-ttl", type=int, default=STEP_TTL_S)
     ap.add_argument("--pending-ttl", type=int, default=PENDING_TTL_S)
     ap.add_argument("--open-ttl", type=int, default=OPEN_TTL_S)
-    ap.add_argument("--totp-secret", default=None, help="fichier base32 (optionnel)")
+    ap.add_argument("--totp-secret", default=None, help="chemin fichier base32 (optionnel)")
     args=ap.parse_args()
 
-    S.bind_ip=args.bind_ip
-    S.ifaces=pick_ifaces(args.iface)
-    S.rotate_s=max(20, int(args.rotate))
-    S.step_ttl=max(2, int(args.step_ttl))
-    S.pending_ttl=max(2, int(args.pending_ttl))
-    S.open_ttl=max(5, int(args.open_ttl))
-    S.master=ensure_master_secret()
+    S.bind_ip    = args.bind_ip
+    S.http_port  = int(args.http_port)
+    S.ifaces     = pick_ifaces(args.iface)
+    S.rotate_s   = max(20, int(args.rotate))
+    S.step_ttl   = max(2, int(args.step_ttl))
+    S.pending_ttl= max(2, int(args.pending_ttl))
+    S.open_ttl   = max(5, int(args.open_ttl))
+    S.master     = ensure_master_secret()
     load_enrolled()
     if args.totp_secret:
         if not os.path.exists(args.totp_secret):
-            print(f"Secret TOTP introuvable : {args.totp_secret}", file=sys.stderr); sys.exit(1)
+            print(f"Secret TOTP introuvable: {args.totp_secret}", file=sys.stderr); sys.exit(1)
         S.totp_secret = b32_read(open(args.totp_secret).read())
 
     nft_install(); start_sshd()
     roll_ports(); threading.Thread(target=rotator_thread, daemon=True).start()
 
-    httpd=ThreadingHTTPServer((S.bind_ip, HTTP_PORT), Api)
+    httpd = ThreadingHTTPServer((S.bind_ip, S.http_port), Api)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    LOG("HTTP", bind=f"{S.bind_ip}:{HTTP_PORT}", totp=bool(S.totp_secret))
-    LOG("READY", ip=S.bind_ip, http=HTTP_PORT, ssh=SSH_PORT)
+    LOG("HTTP", bind=f"{S.bind_ip}:{S.http_port}", totp=bool(S.totp_secret))
+    LOG("READY", ip=S.bind_ip, ssh=SSH_PORT)
 
-    for ifc in S.ifaces: threading.Thread(target=start_sniffer, args=(ifc,), daemon=True).start()
+    for ifc in S.ifaces:
+        threading.Thread(target=start_sniffer, args=(ifc,), daemon=True).start()
 
     def _sig(*_): S.stop_evt.set()
     signal.signal(signal.SIGINT,_sig); signal.signal(signal.SIGTERM,_sig)
