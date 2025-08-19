@@ -3,16 +3,16 @@
 """
 POC5 — Serveur « hard »
 - Séquence : TCP SYN -> UDP -> ICMP Echo
-- Rotation P1/P2 déterministe (HMAC(secret, window)) ; tolère fenêtre N-1
+- Rotation P1/P2 par HMAC(secret, window). Tolère fenêtre N-1.
 - API HTTP : GET /ports, POST /enroll, POST /knock (SPA signé Ed25519)
-- TOTP optionnel (généré automatiquement si absent)
-- Rate-limit côté API (token bucket), pas de rate-limit sur le sniff
-- Ouverture via nftables (@allowed timeout) sur SSH:2222
+- TOTP optionnel (--require-totp). Secret auto-généré et copié pour le client local.
+- Rate-limit côté API uniquement sur /knock (token bucket).
+- Ouverture via nftables : set @allowed (timeout) pour SSH:2222
 Usage :
   sudo python3 poc5_server_hard.py 127.0.0.1 --iface lo
 """
 
-import os, sys, time, json, base64, argparse, signal, threading, struct, hashlib, hmac, subprocess, shutil
+import os, sys, time, json, base64, argparse, signal, threading, struct, hashlib, hmac, subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Tuple, Optional
 
@@ -30,7 +30,7 @@ MASTER_SECRET_PATH = "/etc/portknock/secret"        # base64
 TOTP_PATH          = "/etc/portknock/totp_base32"   # base32
 ENROLL_DB          = "/etc/portknock/keys.json"     # {kid: pub_raw_b64u}
 
-# rate-limit pour l’API (pas le sniff)
+# rate-limit API (seulement /knock)
 RL_API_BURST = 20.0
 RL_API_RATE  = 10.0   # jetons par seconde
 
@@ -57,19 +57,19 @@ def de_b64u(s: str) -> bytes: return base64.urlsafe_b64decode(s + "=" * (-len(s)
 def canon_bytes(obj) -> bytes: return json.dumps(obj, separators=(",", ":"), sort_keys=True).encode()
 
 def run(cmd: str) -> Tuple[int, str, str]:
-    p = subprocess.run(["bash","-lc",cmd], capture_output=True, text=True)
+    p = subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True)
     return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
 
-# TOTP minimal (RFC6238, SHA-1, 6 digits)
+# TOTP (RFC6238, SHA-1)
 def b32_read(raw: str) -> bytes:
     tok = "".join(raw.strip().split())
     return base64.b32decode(tok.upper())
 def totp_now(secret: bytes, for_time: int, step=30, digits=6) -> int:
     ctr = int(for_time // step)
     msg = struct.pack(">Q", ctr)
-    digest = hmac.new(secret, msg, hashlib.sha1).digest()
-    off = digest[-1] & 0x0F
-    code = ((digest[off] & 0x7F) << 24) | (digest[off+1] << 16) | (digest[off+2] << 8) | digest[off+3]
+    dig = hmac.new(secret, msg, hashlib.sha1).digest()
+    off = dig[-1] & 0x0F
+    code = ((dig[off] & 0x7F) << 24) | (dig[off+1] << 16) | (dig[off+2] << 8) | dig[off+3]
     return code % (10**digits)
 def totp_verify(secret: bytes, code: int, now_ts: int) -> bool:
     for k in (-1, 0, 1):
@@ -82,7 +82,6 @@ def derive_port(secret: bytes, label: bytes, lo: int, hi: int) -> int:
     dig = hmac.new(secret, label, hashlib.sha256).digest()
     val = int.from_bytes(dig[:2], "big")
     return lo + (val % (hi - lo + 1))
-
 def win_id(period: int) -> int: return int(time.time() // period)
 
 # ---------- état
@@ -100,10 +99,8 @@ class State:
     pending: Dict[str, float] = {}  # ip -> exp_mono
     nonces: Dict[str, float] = {}   # key -> exp_mono
     enrolled: Dict[str, bytes] = {} # kid -> public raw
-    # rate-limit API
     rl_api: Dict[str, Tuple[float, float]] = {}   # ip -> (tokens,last_mono)
     stop_evt = threading.Event()
-
 S = State()
 
 # ---------- secrets / TOTP / enroll
@@ -126,29 +123,23 @@ def ensure_master_secret() -> bytes:
     return base64.b64decode(tok)
 
 def ensure_totp_secret() -> bytes:
-    # auto-crée un secret si absent et le met aussi dans ~/.config/poc5/totp_base32 (pour le client)
     if not os.path.exists(TOTP_PATH):
-        raw = base64.b32encode(os.urandom(20)).decode().strip().upper()
-        open(TOTP_PATH, "w").write(raw+"\n")
-        os.chmod(TOTP_PATH, 0o600)
-        # copie côté user pour faciliter le client (même machine)
-        home = os.path.expanduser("~")
-        cli_path = os.path.join(home, ".config/poc5/totp_base32")
-        os.makedirs(os.path.dirname(cli_path), exist_ok=True)
-        open(cli_path, "w").write(raw+"\n")
-        os.chmod(cli_path, 0o600)
-        LOG("TOTP", created=True, path=TOTP_PATH, copy=cli_path)
+        raw_b32 = base64.b32encode(os.urandom(20)).decode().strip().upper()
+        open(TOTP_PATH, "w").write(raw_b32+"\n"); os.chmod(TOTP_PATH, 0o600)
+        # copie pour le client local
+        cli = os.path.expanduser("~/.config/poc5/totp_base32")
+        os.makedirs(os.path.dirname(cli), exist_ok=True)
+        open(cli, "w").write(raw_b32+"\n"); os.chmod(cli, 0o600)
+        LOG("TOTP", created=True, server=TOTP_PATH, client_copy=cli)
     else:
-        LOG("TOTP", created=False, path=TOTP_PATH)
+        LOG("TOTP", created=False, server=TOTP_PATH)
     return b32_read(open(TOTP_PATH).read())
 
 def load_enrolled():
     ensure_dirs()
     if os.path.exists(ENROLL_DB):
-        try:
-            S.enrolled = {k: de_b64u(v) for k, v in json.load(open(ENROLL_DB)).items()}
-        except Exception:
-            S.enrolled = {}
+        try: S.enrolled = {k: de_b64u(v) for k, v in json.load(open(ENROLL_DB)).items()}
+        except Exception: S.enrolled = {}
     else:
         S.enrolled = {}
 def save_enrolled():
@@ -165,8 +156,7 @@ add chain inet {NFT_TABLE} {NFT_CHAIN} {{ type filter hook input priority -150; 
 add rule  inet {NFT_TABLE} {NFT_CHAIN} tcp dport {SSH_PORT} ip saddr @{NFT_SET} accept
 add rule  inet {NFT_TABLE} {NFT_CHAIN} tcp dport {SSH_PORT} drop
 """
-    tmp = "/tmp/poc5.nft"
-    open(tmp, "w").write(conf)
+    tmp = "/tmp/poc5.nft"; open(tmp, "w").write(conf)
     run(f"nft -f {tmp}")
     LOG("NFT_READY", table=NFT_TABLE, chain=NFT_CHAIN, set=NFT_SET)
 
@@ -185,7 +175,7 @@ def start_sshd():
     global _sshd
     ensure_host_keys()
     cfg = f"Port {SSH_PORT}\nListenAddress 0.0.0.0\nUsePAM yes\nPasswordAuthentication yes\nPidFile /tmp/poc5_sshd.pid\nLogLevel QUIET\n"
-    path = "/tmp/poc5_sshd.conf"; open(path,"w").write(cfg)
+    path = "/tmp/poc5_sshd.conf"; open(path, "w").write(cfg)
     _sshd = subprocess.Popen(["/usr/sbin/sshd","-f",path],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     LOG("SSHD", listen=f":{SSH_PORT}")
@@ -206,7 +196,7 @@ def roll_ports():
     if p2 == p1: p2 = PORT_MIN + ((p1 + 137) % (PORT_MAX - PORT_MIN + 1))
     exp = int(time.time() + S.rotate_s)
     S.windows.append({"win": w, "p1": p1, "p2": p2, "exp": exp})
-    S.windows[:] = S.windows[-2:]  # garder fen. courante + précédente
+    S.windows[:] = S.windows[-2:]
     LOG("PORTS", p1=p1, p2=p2, exp=exp)
 
 def rotator_thread():
@@ -259,7 +249,6 @@ class Api(BaseHTTPRequestHandler):
             except Exception: return self._json(400, {"error":"bad_json"})
 
         if self.path == "/enroll":
-            # pas de rate-limit agressif ici
             kid = str(data.get("kid",""))[:32]
             pub = str(data.get("pubkey",""))
             if not kid or not pub: return self._json(400, {"error":"missing_fields"})
@@ -277,11 +266,9 @@ class Api(BaseHTTPRequestHandler):
             sig_b64 = str(data.get("sig",""))
             if not kid or not sig_b64: return self._json(400, {"error":"missing_fields"})
 
-            # doit être en état pending
             if S.pending.get(ip, 0.0) < time.monotonic():
                 return self._json(403, {"error":"not_pending"})
 
-            # anti-rejeu
             nonce = str(data.get("nonce",""))[:64]
             nowm = time.monotonic()
             for k in list(S.nonces.keys()):
@@ -291,7 +278,6 @@ class Api(BaseHTTPRequestHandler):
                 return self._json(403, {"error":"replay_nonce"})
             S.nonces[key] = nowm + 300.0
 
-            # signature
             pk_raw = S.enrolled.get(kid)
             if not pk_raw: return self._json(403, {"error":"unknown_kid"})
             pk = Ed25519PublicKey.from_public_bytes(pk_raw)
@@ -301,19 +287,16 @@ class Api(BaseHTTPRequestHandler):
             except Exception:
                 return self._json(403, {"error":"bad_sig"})
 
-            # fraîcheur
             ts = int(data.get("ts",0))
             if ts <= 0 or abs(int(time.time()) - ts) > 90:
                 return self._json(403, {"error":"stale_ts"})
 
-            # TOTP si activé
             if S.totp_secret is not None:
                 try: code = int(str(data.get("totp","")).strip())
                 except Exception: return self._json(403, {"error":"totp_required"})
                 if not totp_verify(S.totp_secret, code, int(time.time())):
                     return self._json(403, {"error":"totp_bad"})
 
-            # ouverture
             ttl = max(5, min(3600, int(data.get("duration", S.open_ttl))))
             nft_open(ip, ttl)
             S.pending.pop(ip, None)
@@ -328,7 +311,6 @@ def handle_pkt(p):
         if p[IP].dst != S.bind_ip: return
         ip = p[IP].src
 
-        # purge progression expirée
         st = S.prog.get(ip)
         nowm = time.monotonic()
         if st and nowm - st[2] > S.step_ttl:
@@ -338,35 +320,27 @@ def handle_pkt(p):
         if not wins: return
         wmap = {w["win"]:(w["p1"], w["p2"]) for w in wins}
 
-        # Étape 1 : TCP SYN -> p1 (fenêtre N ou N-1)
         if p.haslayer(TCP):
             f = int(p[TCP].flags)
             if (f & 0x02) and not (f & 0x10):
                 d = int(p[TCP].dport)
                 for w in wins:
                     if d == w["p1"]:
-                        S.prog[ip] = (1, w["win"], nowm)
-                        LOG("STEP1", ip=ip)
-                        return
+                        S.prog[ip] = (1, w["win"], nowm); LOG("STEP1", ip=ip); return
 
-        # Étape 2 : UDP -> p2 (même fenêtre)
         if st and st[0] == 1 and p.haslayer(UDP):
-            d = int(p[UDP].dport); p1, p2 = wmap.get(st[1], (None, None))
+            d = int(p[UDP].dport); _, p2 = wmap.get(st[1], (None, None))
             if p2 and d == p2:
-                S.prog[ip] = (2, st[1], nowm)
-                LOG("STEP2", ip=ip)
-                return
+                S.prog[ip] = (2, st[1], nowm); LOG("STEP2", ip=ip); return
 
-        # Étape 3 : ICMP echo
         if st and st[0] == 2 and p.haslayer(ICMP) and int(p[ICMP].type) == 8:
             S.prog.pop(ip, None)
             S.pending[ip] = time.monotonic() + S.pending_ttl
             LOG("PENDING", ip=ip, ttl=f"{S.pending_ttl:.1f}")
             return
 
-        # purge pending
         for k,v in list(S.pending.items()):
-            if v < nowm: S.pending.pop(k,None)
+            if v < nowm: S.pending.pop(k, None)
     except Exception as e:
         LOG("SNIFF_ERR", err=str(e))
 
@@ -393,8 +367,6 @@ def pick_ifaces(user: Optional[str]) -> list:
 def cleanup():
     try: nft_cleanup()
     except: pass
-    try: stop_sshd()
-    except: pass
     LOG("CLEANUP")
 
 def main():
@@ -406,8 +378,7 @@ def main():
     ap.add_argument("--step-ttl", type=int, default=STEP_TTL_S)
     ap.add_argument("--pending-ttl", type=int, default=PENDING_TTL_S)
     ap.add_argument("--open-ttl", type=int, default=OPEN_TTL_S)
-    ap.add_argument("--require-totp", action="store_true",
-                    help="Active TOTP (auto-généré si absent)")
+    ap.add_argument("--require-totp", action="store_true", help="Active TOTP (auto-généré si absent)")
     args = ap.parse_args()
 
     S.bind_ip = args.bind_ip
@@ -418,12 +389,12 @@ def main():
     S.open_ttl    = max(5, int(args.open_ttl))
 
     S.master = ensure_master_secret()
-    if args.require_totp:
-        S.totp_secret = ensure_totp_secret()
+    if args.require_totp: S.totp_secret = ensure_totp_secret()
     load_enrolled()
 
-    nft_install(); start_sshd()
-    roll_ports(); threading.Thread(target=rotator_thread, daemon=True).start()
+    nft_install()
+    roll_ports()
+    threading.Thread(target=rotator_thread, daemon=True).start()
 
     httpd = ThreadingHTTPServer((S.bind_ip, HTTP_PORT), Api)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -436,7 +407,7 @@ def main():
     def _sig(*_): S.stop_evt.set()
     signal.signal(signal.SIGINT, _sig); signal.signal(signal.SIGTERM, _sig)
     try:
-        while not S.stop_evt.is_set(): time.sleep(0.5)
+        while not S.stop_evt.is_set(): time.sleep(0.4)
     finally:
         httpd.shutdown(); cleanup()
 
