@@ -17,30 +17,3 @@ client --> knock 7000 --> knock 8000 --> knock 9000 --> serveur
 Le client envoie une série de requêtes TCP SYN sur des ports prédéfinis.
 Si la séquence est correcte, le serveur ajoute temporairement une règle
 `iptables` permettant la connexion sur le port protégé.
-
-## Prérequis
-
-- Python ≥ 3.7
-- [Scapy](https://scapy.net)
-- Droits root (pour sniffer et modifier iptables)
-
-## Installation
-
-```bash
-pip3 install scapy
-```
-
-## Tests POC5
-
-```bash
-# auto-test du décodage
-sudo python3 poc5/poc5_server_timing.py --selftest
-
-# client sans émission (aperçu des bits)
-sudo python3 poc5/poc5_client_timing.py 127.0.0.1 --dry-run
-
-# boucle locale
-sudo python3 poc5/poc5_server_timing.py --iface lo &
-sudo python3 poc5/poc5_client_timing.py 127.0.0.1
-```
-
