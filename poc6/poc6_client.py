@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-POC6 — Client SPA 100% UDP
-- Auto-découverte HTTP (/info), enrôlement (/enroll), puis envoi d’un SPA UDP.
-- SPA: PoW + X25519/HKDF → AES-GCM + signature Ed25519 + TOTP (optionnel).
-Usage minimal: sudo python3 poc6_client.py 127.0.0.1
+POC6 — Client SPA 100% UDP, avec barre de progression PoW et scénarios d'échec (démo).
+- Auto-découverte /info, enrôlement /enroll, envoi SPA, attente SSH, stats PoW.
+Usage: sudo python3 poc6_client.py 127.0.0.1
 """
 
 import os, sys, time, json, base64, argparse, socket, struct, hashlib, secrets, http.client
@@ -26,6 +25,10 @@ UDP_PORT_DEFAULT  = 45446
 HTTP_PORT_DEFAULT = 45447
 SSH_PORT          = 2222
 
+# colors
+C_G="\033[32m"; C_Y="\033[33m"; C_R="\033[31m"; C_C="\033[36m"; C_RS="\033[0m"
+def col(s,c): return f"{c}{s}{C_RS}"
+
 def b64u(b: bytes) -> str: return base64.urlsafe_b64encode(b).decode().rstrip("=")
 def de_b64u(s: str) -> bytes: return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 def canon_bytes(obj) -> bytes: return json.dumps(obj, separators=(",",":"), sort_keys=True, ensure_ascii=False).encode()
@@ -38,11 +41,12 @@ def ensure_keys():
     else:
         sk = ed25519.Ed25519PrivateKey.generate()
         pk_raw = sk.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
-        pem = sk.private_bytes(encoding=serialization.Encoding.PEM, format=serialization.PrivateFormat.PKCS8, encryption_algorithm=serialization.NoEncryption())
+        pem = sk.private_bytes(encoding=serialization.Encoding.PEM, format=serialization.PrivateFormat.PKCS8,
+                               encryption_algorithm=serialization.NoEncryption())
         open(SK_PATH,"wb").write(pem); os.chmod(SK_PATH,0o600)
         open(PK_PATH,"w").write(b64u(pk_raw)+"\n")
-    kid_hex = hashlib.sha256(pk_raw).hexdigest()[:16]        # pour /enroll et le JSON
-    kid16   = hashlib.sha256(pk_raw).digest()[:16]           # 16 OCTETS BRUTS pour l'entête UDP
+    kid_hex = hashlib.sha256(pk_raw).hexdigest()[:16]        # pour JSON/enroll
+    kid16   = hashlib.sha256(pk_raw).digest()[:16]           # 16B bruts pour l'entête UDP
     return sk, pk_raw, kid_hex, kid16
 
 def read_totp_code():
@@ -62,13 +66,14 @@ def read_totp_code():
 def leading_zero_bits(h: bytes) -> int:
     n=0
     for b in h:
-        if b == 0: n+=8
+        if b==0: n+=8
         else:
             for i in range(7,-1,-1):
-                if (b>>i)&1: return n + (7-i)
+                if (b>>i)&1: return n+(7-i)
             return n
     return n
 
+# HTTP helpers
 def http_get_json(host: str, port: int, path: str):
     conn = http.client.HTTPConnection(host, port, timeout=4.0)
     conn.request("GET", path); r = conn.getresponse(); data=r.read(); conn.close()
@@ -82,22 +87,36 @@ def http_post_json(host: str, port: int, path: str, obj: dict):
     try: return r.status, json.loads(data.decode())
     except Exception: return r.status, {}
 
-def pow_solve(kid16: bytes, c_eph_pub: bytes, window_id: int, salt: bytes, bits: int, limit_iters: int = 5_000_000) -> bytes:
-    for _ in range(limit_iters):
+# PoW avec progression
+def pow_solve_progress(kid16: bytes, c_eph_pub: bytes, win: int, salt: bytes, bits: int, limit: int = 10_000_000):
+    tries=0; t0=time.time(); best=0
+    while tries < limit:
         nonce = secrets.token_bytes(8)
-        h = hashlib.sha256(b"PK6"+bytes([1])+struct.pack("!I",window_id)+salt+kid16+c_eph_pub+nonce).digest()
-        if leading_zero_bits(h) >= bits: return nonce
-    raise RuntimeError("PoW non trouvé (augmentez la limite/baissez la difficulté)")
+        h = hashlib.sha256(b"PK6"+bytes([1])+struct.pack("!I",win)+salt+kid16+c_eph_pub+nonce).digest()
+        z = leading_zero_bits(h)
+        if z>best: best=z
+        tries += 1
+        if z >= bits:
+            dt=time.time()-t0
+            print(col(f"[PoW] trouvé en {tries} itérations ({dt:.2f}s) — {z} bits", C_G))
+            return nonce, tries, best, dt
+        if tries % 50000 == 0:
+            bar = "#" * min(30, int(30*best/max(bits,1)))
+            print(col(f"[PoW] essais={tries//1000}k  meilleur={best} bits  [{bar:<30}]", C_C))
+    raise RuntimeError("PoW non trouvé (augmentez la limite ou baissez la difficulté)")
 
 def build_packet(server_pub_b64u: str, difficulty_bits: int, difficulty_salt_b64u: str,
                  duration: int, totp_required: bool, sk_ed: ed25519.Ed25519PrivateKey,
-                 kid_hex: str, kid16: bytes):
+                 kid_hex: str, kid16: bytes,
+                 fail_pow=False, fail_sig=False, fail_window=False, fail_totp=False):
     s_pub = de_b64u(server_pub_b64u); diff_salt = de_b64u(difficulty_salt_b64u)
-
     c_sk = x25519.X25519PrivateKey.generate()
     c_epub = c_sk.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
     win = int(time.time()//30)
-    pow_nonce = pow_solve(kid16, c_epub, win, diff_salt, difficulty_bits)
+    if fail_window: win += 4  # hors fenêtre
+    pow_nonce, tries, best, dt = pow_solve_progress(kid16, c_epub, win, diff_salt, difficulty_bits)
+    if fail_pow:
+        difficulty_bits = min(255, difficulty_bits+6)  # serveur refusera
 
     shared = c_sk.exchange(x25519.X25519PublicKey.from_public_bytes(s_pub))
     salt = hashlib.sha256(s_pub + c_epub + struct.pack("!I", win)).digest()
@@ -108,15 +127,21 @@ def build_packet(server_pub_b64u: str, difficulty_bits: int, difficulty_salt_b64
     if totp_required:
         code = read_totp_code()
         if code is None:
-            print("TOTP requis : placez votre secret base32 dans", TOTP_PATH, file=sys.stderr); sys.exit(1)
+            print(col("TOTP requis mais introuvable (~/.config/poc6/totp_base32)", C_R)); sys.exit(1)
         payload["totp"] = int(code)
-    sig = sk_ed.sign(canon_bytes(payload))
-    payload_signed = dict(payload); payload_signed["sig"] = b64u(sig)
-    pt = json.dumps(payload_signed, separators=(",",":"), sort_keys=True).encode()
+        if fail_totp: payload["totp"] = (int(code) + 111111) % 1000000
 
+    sig = sk_ed.sign(canon_bytes(payload))
+    if fail_sig:
+        b=bytearray(sig); b[0]^=1; sig=bytes(b)   # corrompt la signature
+    payload_signed = dict(payload); payload_signed["sig"] = b64u(sig)
+
+    pt = json.dumps(payload_signed, separators=(",",":"), sort_keys=True).encode()
     aad = b"PK6|" + struct.pack("!BIB", 1, win, difficulty_bits) + c_epub + kid16 + pow_nonce
     ct = aead.encrypt(aead_nonce, pt, aad)
     header = b"PK6" + bytes([1]) + struct.pack("!I", win) + bytes([difficulty_bits]) + c_epub + kid16 + pow_nonce + aead_nonce
+
+    print(col(f"[HDR] win={win} diff={difficulty_bits} kid16={b64u(kid16)}", C_Y))
     return header + ct
 
 def wait_ssh(host: str, port: int=SSH_PORT, timeout: float=10.0) -> bool:
@@ -130,41 +155,46 @@ def wait_ssh(host: str, port: int=SSH_PORT, timeout: float=10.0) -> bool:
     return False
 
 def main():
-    ap=argparse.ArgumentParser(description="POC6 client (SPA UDP)")
+    ap=argparse.ArgumentParser(description="POC6 client (SPA UDP) + PoW progress + tests d'échec")
     ap.add_argument("server")
     ap.add_argument("--udp", type=int, default=UDP_PORT_DEFAULT)
     ap.add_argument("--http", type=int, default=HTTP_PORT_DEFAULT)
     ap.add_argument("--duration", type=int, default=60)
     ap.add_argument("--no-ssh", action="store_true")
+    ap.add_argument("--fail-pow", action="store_true")
+    ap.add_argument("--fail-sig", action="store_true")
+    ap.add_argument("--fail-window", action="store_true")
+    ap.add_argument("--fail-totp", action="store_true")
     args=ap.parse_args()
 
     dst = socket.gethostbyname(args.server)
     sk, pk_raw, kid_hex, kid16 = ensure_keys()
-    print(f"[CLIENT] cible={dst} kid={kid_hex}")
+    print(col(f"[CLIENT] cible={dst} kid={kid_hex}", C_C))
 
     code, info = http_get_json(dst, args.http, "/info")
     if code != 200:
-        print(f"[ERREUR] GET /info HTTP {code}", file=sys.stderr); sys.exit(1)
+        print(col(f"[ERREUR] GET /info HTTP {code}", C_R)); sys.exit(1)
     s_pub = info.get("server_pub",""); diff_bits = int(info.get("difficulty_bits", 18))
     diff_salt = info.get("difficulty_salt",""); totp_required = bool(info.get("totp_required", False))
-    print(f"[INFO] diff={diff_bits} totp_required={totp_required} udp={info.get('udp')} ssh={info.get('ssh')}")
+    print(col(f"[INFO] diff={diff_bits} totp_required={totp_required} udp={info.get('udp')} ssh={info.get('ssh')}", C_Y))
 
     code, _ = http_post_json(dst, args.http, "/enroll", {"kid": kid_hex, "pubkey": b64u(pk_raw)})
     if code != 200:
-        print(f"[WARN] /enroll HTTP {code} (peut être déjà enrôlé)", file=sys.stderr)
+        print(col(f"[WARN] /enroll HTTP {code} (peut être déjà enrôlé)", C_Y))
 
-    pkt = build_packet(s_pub, diff_bits, diff_salt, args.duration, totp_required, sk, kid_hex, kid16)
+    pkt = build_packet(s_pub, diff_bits, diff_salt, args.duration, totp_required, sk, kid_hex, kid16,
+                       fail_pow=args.fail_pow, fail_sig=args.fail_sig, fail_window=args.fail_window, fail_totp=args.fail_totp)
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.sendto(pkt, (dst, args.udp)); s.close()
-    print("[SEND] SPA envoyé")
+    print(col("[SEND] SPA envoyé", C_G))
 
     if args.no_ssh: return
-    print("[WAIT] ouverture SSH:2222...")
+    print(col("[WAIT] ouverture SSH:2222...", C_C))
     if wait_ssh(dst, SSH_PORT, 10.0):
         user = os.environ.get("SUDO_USER") or os.environ.get("USER") or "root"
-        print("[SSH] connexion...")
+        print(col("[SSH] connexion...", C_G))
         os.execvp("ssh", ["ssh", "-p", str(SSH_PORT), "-o", "StrictHostKeyChecking=accept-new", f"{user}@{args.server}"])
     else:
-        print("[INFO] SSH encore fermé (timeout).")
+        print(col("[INFO] SSH encore fermé (timeout).", C_Y))
 
 if __name__=="__main__":
     main()
