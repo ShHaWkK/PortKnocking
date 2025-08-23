@@ -7,12 +7,12 @@ SSH_PORT          = 2222
 SSH_LISTEN        = "127.0.0.1"
 IFACE_DEFAULT     = "lo"
 
-KNOCKS_WINDOW_S   = 30        # fenêtre HMAC
-ALLOW_PAST_WINDOWS= 1         # tolère N-1
+KNOCKS_WINDOW_S   = 30      # fenêtre HMAC
+ALLOW_PAST_WINDOWS= 1       # tolère N-1
 SEQUENCE_LEN      = 3
 MIN_PORT, MAX_PORT= 40000, 50000
-MAX_SEQ_JITTER    = 10        # 10 s entre deux knocks
-DUP_SUPPRESS_S    = 2.0       # ignorer retransmissions du même port pendant N s
+MAX_SEQ_JITTER    = 10     # 10 s entre deux knocks
+DUP_SUPPRESS_S    = 2.0     # ignorer retransmissions du même port pendant N s
 SPA_PORT          = 45444
 SPA_TTL_S         = 120       # validité nonce/ts SPA
 SPA_GRACE_S       = 10        # délai max séquenceOK -> SPA
