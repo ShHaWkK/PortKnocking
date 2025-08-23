@@ -1,5 +1,0 @@
-challenge: secretchallenge
-knock_port: 5007
-service_port: 5008
-open_duration: 5
-log_file: logs/server_dh.log
