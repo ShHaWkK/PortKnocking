@@ -111,9 +111,9 @@ def emit(evt: str, **kw):
     # Console
     if evt=="open":
         print(col(f"[OPEN] ip={kw.get('ip')} ttl={kw.get('ttl')}s", COL.G))
-        print(col("╔════════════════════╗", COL.G))
+        print(col("======================", COL.G))
         print(col("║     SSH OUVERT     ║", COL.G))
-        print(col("╚════════════════════╝", COL.G))
+        print(col("======================", COL.G))
     elif evt=="ok":
         print(col(f"[OK] kid={kw.get('kid')} ip={kw.get('ip')} dur={kw.get('dur')}s bits={kw.get('bits')}", COL.C))
     elif evt=="reject":
