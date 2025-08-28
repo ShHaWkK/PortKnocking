@@ -251,21 +251,95 @@ def leading_zero_bits(h: bytes) -> int:
     return n
 
 # --- HTTP
-HTML_UI = """<!doctype html>
+
+HTML_UI = """
+<!doctype html>
 <html><head><meta charset="utf-8"><title>POC6 Live</title>
 <style>
-body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;background:#0b1220;color:#e4ecff;margin:0}
-header{padding:14px 18px;background:#111a2e;border-bottom:1px solid #1c2847;display:flex;gap:12px;align-items:center}
-.badge{background:#1c2847;border-radius:999px;padding:5px 10px;font-size:12px}
-#stream{padding:12px 18px}
-.ev{padding:8px 10px;margin:6px 0;border-radius:8px;background:#101a33;border:1px solid #1e2b50}
-.ev.ok,.ev.open{border-color:#1e7845;background:#0f2a22}
-.ev.reject{border-color:#8b1e1e;background:#2a1212}
-small{opacity:.7}
+body{
+    font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;
+    background:#0b1220;
+    color:#e4ecff;
+    margin:0;
+}
+header{
+    padding:18px 24px;
+    background:#1a2747;
+    border-bottom:2px solid #2e4370;
+    display:flex;
+    gap:18px;
+    align-items:center;
+    box-shadow:0 2px 8px #0006;
+}
+.badge{
+    background:#2e4370;
+    border-radius:999px;
+    padding:8px 16px;
+    font-size:15px;
+    font-weight:bold;
+    color:#fff;
+    letter-spacing:1px;
+    box-shadow:0 1px 4px #0004;
+    text-decoration:none;
+    transition:background 0.2s;
+}
+.badge:hover{
+    background:#3e5ca0;
+}
+#stream{
+    padding:18px 24px;
+}
+.ev{
+    padding:14px 18px;
+    margin:10px 0;
+    border-radius:12px;
+    background:#101a33;
+    border:2px solid #1e2b50;
+    font-size:16px;
+    box-shadow:0 2px 8px #0003;
+    transition:background 0.2s, border-color 0.2s;
+}
+.ev.ok,.ev.open{
+    border-color:#1e7845;
+    background:#143d2a;
+    color:#bfffd0;
+}
+.ev.open{
+    border-color:#2eea7a;
+    background:#1f5c3a;
+    color:#eafff0;
+    font-weight:bold;
+}
+.ev.reject{
+    border-color:#c02e2e;
+    background:#2a1212;
+    color:#ffd0d0;
+}
+small{
+    opacity:.7;
+    font-size:13px;
+}
+b{
+    font-size:17px;
+    letter-spacing:1px;
+}
+code{
+    font-size:15px;
+    background:#1c2847;
+    padding:3px 7px;
+    border-radius:6px;
+    color:#e4ecff;
+    margin-top:4px;
+    display:inline-block;
+}
+@media (max-width:600px){
+    header,#stream{padding:10px;}
+    .ev{padding:8px;}
+}
 </style></head>
 <body>
 <header>
-  <div class="badge">POC6</div>
+  <div class="badge" style="font-size:18px;background:#2eea7a;color:#0b1220;">POC6</div>
   <div id="hdr">Live events — connecting…</div>
   <a class="badge" href="/status">/status</a>
   <a class="badge" href="/info">/info</a>
@@ -278,11 +352,13 @@ function line(rec){
   const ts=new Date(rec.ts*1000).toLocaleTimeString();
   d.innerHTML='<b>['+rec.evt.toUpperCase()+']</b> <small>'+ts+'</small><br><code>'+JSON.stringify(rec)+'</code>';
   root.prepend(d); while(root.childElementCount>200) root.lastChild.remove();
+  d.style.animation="fadein 0.7s";
 }
 const es=new EventSource('/events'); hdr.textContent='Live events — connected';
 es.onmessage=(e)=>{ try{ line(JSON.parse(e.data)); }catch{} };
 es.onerror=()=>{ hdr.textContent='Live events — disconnected (retrying...)'; };
-</script></body></html>"""
+</script>
+</body></html>"""
 
 class Api(BaseHTTPRequestHandler):
     server_version = "poc6/udp/2.0"
