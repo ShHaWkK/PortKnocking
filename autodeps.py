@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-autodeps.py — utilitaires d'auto-install "raisonnable" pour tes POC
+autodeps.py — utilitaires d'auto-install  pour les POC
 - Installe les paquets Python manquants (pip).
 - Vérifie/installe les binaires système selon le gestionnaire présent (apt/dnf/pacman/zypper).
 - Comportement :
   * Si root => installe directement.
   * Si non-root => tente `sudo`, sinon affiche la commande claire à lancer.
-- Écrit pour rester lisible le jour de la soutenance (pas de magie noire).
 """
 
 import os, shutil, subprocess, sys

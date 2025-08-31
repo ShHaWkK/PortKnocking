@@ -1,1 +1,13 @@
+# Dépendances communes à tous les POC
 scapy==2.5.0
+colorama==0.4.6
+pycryptodome==3.19.0
+cryptography==41.0.7
+
+# POC4 et POC6 - TOTP
+pyotp==2.9.0
+
+# POC5 - QR codes
+qrcode[pil]==7.4.2
+pillow==10.1.0
+pyzbar==0.1.9
