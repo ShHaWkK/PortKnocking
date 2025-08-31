@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
 POC5 — Client (QR)
 - Découvre P1/P2 (GET /ports), knock TCP->UDP->ICMP
